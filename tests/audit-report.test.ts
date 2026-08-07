@@ -101,6 +101,27 @@ describe('aggregateAudit', () => {
     expect(rows[0]!.cost.recomputedTotalUSD).toBe(0)
   })
 
+  it('gives copilot supplementary accounting no call weight and no phantom reasoning output', async () => {
+    // One served request recorded twice: the per-turn call carries the full output, the
+    // paired store row carries that output's reasoning subset plus real input/cache tokens.
+    const perTurn = makeCall({ inputTokens: 300, outputTokens: 500, cacheReadInputTokens: 1000 }, 1.0, 'claude-sonnet-4-5', 'copilot')
+    const supplementary: ParsedApiCall = {
+      ...makeCall({ inputTokens: 40, outputTokens: 0, reasoningTokens: 800, cacheReadInputTokens: 900 }, 0.5, 'claude-sonnet-4-5', 'copilot'),
+      supplementaryAccounting: true,
+    }
+    const rows = await aggregateAudit([makeProject([perTurn, supplementary])])
+
+    expect(rows).toHaveLength(1)
+    const r = rows[0]!
+    expect(r.calls).toBe(1)
+    expect(r.displayed.outputTokens).toBe(500)
+    // Raw stays untouched, and tokens/cost keep every call, supplementary included.
+    expect(r.raw.reasoningTokens).toBe(800)
+    expect(r.raw.inputTokens).toBe(340)
+    expect(r.displayed.cacheReadTokens).toBe(1900)
+    expect(r.attributedCostUSD).toBeCloseTo(1.5)
+  })
+
   it('splits buckets by (provider, model)', async () => {
     const rows = await aggregateAudit([makeProject([
       makeCall({ inputTokens: 10 }, 0.1, 'model-a', 'claude'),

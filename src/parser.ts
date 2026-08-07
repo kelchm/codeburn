@@ -25,9 +25,11 @@ import {
   loadCache,
   reconcileFile,
   saveCache,
+  sourcePathStatCandidates,
 } from './session-cache.js'
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
 import { dateKey } from './day-aggregator.js'
+import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -1676,14 +1678,21 @@ function buildSessionSummary(
   for (const turn of turns) {
     const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
     const turnSavings = turn.assistantCalls.reduce((s, c) => s + (c.savingsUSD ?? 0), 0)
+    // A turn whose calls are all supplementary accounting (copilot rollup /
+    // paired store rows) is not a behavioral exchange: its cost still lands in
+    // the category so breakdowns keep summing to the totals, but it adds no
+    // turn/edit/retry weight. Sessions normally never hold such turns (they
+    // are folded into behavioral turns upstream); this covers the
+    // accounting-only container of a session with no behavioral turns at all.
+    const behavioralTurn = isBehavioralTurn(turn)
 
     if (!categoryBreakdown[turn.category]) {
       categoryBreakdown[turn.category] = { turns: 0, costUSD: 0, savingsUSD: 0, retries: 0, editTurns: 0, oneShotTurns: 0 }
     }
-    categoryBreakdown[turn.category].turns++
+    if (behavioralTurn) categoryBreakdown[turn.category].turns++
     categoryBreakdown[turn.category].costUSD += turnCost
     categoryBreakdown[turn.category].savingsUSD += turnSavings
-    if (turn.hasEdits) {
+    if (behavioralTurn && turn.hasEdits) {
       categoryBreakdown[turn.category].editTurns++
       categoryBreakdown[turn.category].retries += turn.retries
       if (turn.retries === 0) categoryBreakdown[turn.category].oneShotTurns++
@@ -1694,10 +1703,10 @@ function buildSessionSummary(
       if (!skillBreakdown[skillKey]) {
         skillBreakdown[skillKey] = { turns: 0, costUSD: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
       }
-      skillBreakdown[skillKey].turns++
+      if (behavioralTurn) skillBreakdown[skillKey].turns++
       skillBreakdown[skillKey].costUSD += turnCost
       skillBreakdown[skillKey].savingsUSD += turnSavings
-      if (turn.hasEdits) {
+      if (behavioralTurn && turn.hasEdits) {
         skillBreakdown[skillKey].editTurns++
         if (turn.retries === 0) skillBreakdown[skillKey].oneShotTurns++
       }
@@ -1714,7 +1723,9 @@ function buildSessionSummary(
       totalReasoning += call.usage.reasoningTokens
       totalCacheRead += call.usage.cacheReadInputTokens
       totalCacheWrite += call.usage.cacheCreationInputTokens
-      apiCalls++
+      // Supplementary accounting calls contribute tokens/cost above but are
+      // not distinct requests: no api-call or per-model call weight.
+      if (isBehavioralCall(call)) apiCalls++
 
       const modelKey = call.provider === 'devin' ? call.model : getShortModelName(call.model)
       if (!modelBreakdown[modelKey]) {
@@ -1726,7 +1737,7 @@ function buildSessionSummary(
           tokens: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0 },
         }
       }
-      modelBreakdown[modelKey].calls++
+      if (isBehavioralCall(call)) modelBreakdown[modelKey].calls++
       modelBreakdown[modelKey].costUSD += call.costUSD
       modelBreakdown[modelKey].savingsUSD += callSavings
       modelBreakdown[modelKey].estimatedCostUSD = (modelBreakdown[modelKey].estimatedCostUSD ?? 0) + callEstimated
@@ -2404,6 +2415,8 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.locAdded ? { locAdded: call.locAdded } : {}),
     ...(call.locRemoved ? { locRemoved: call.locRemoved } : {}),
     ...(call.editFailed ? { editFailed: call.editFailed } : {}),
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2524,7 +2537,14 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
 
 function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
   const u = call.usage
-  const outputForCost = call.provider === 'claude'
+  // Claude thinking and Copilot reasoning tokens are already INSIDE
+  // outputTokens (Copilot's own per-request token_details_json prices
+  // input/cache/output and nothing else, and its reasoning counts are a
+  // subset of the output count), so adding them here would bill them twice —
+  // for copilot literally so: its session-store/shutdown supplementary calls
+  // carry reasoningTokens with outputTokens 0 while the per-turn call bills
+  // the full output. Other providers report reasoning separately from output.
+  const outputForCost = call.provider === 'claude' || call.provider === 'copilot'
     ? u.outputTokens
     : u.outputTokens + u.reasoningTokens
   const costUSD = calculateCost(
@@ -2582,6 +2602,111 @@ function cachedTurnToClassified(turn: CachedTurn, resolvedBranch?: string): Clas
     ...(turn.spawnToolUseIds?.length ? { spawnToolUseIds: turn.spawnToolUseIds } : {}),
   }
   return classifyTurn(parsed)
+}
+
+// Copilot behavioral-weight assignment + turn folding, applied per session at
+// serve time just before summarization. A shutdown rollup (or its synthesized
+// residual) is aggregate accounting, never a request, so it is always
+// supplementary. A store row is one real request, but when the request's
+// per-turn call exists in the cache its row is supplementary too — only the
+// unpaired rows (store-only requests: a crash or pruned session-state lost
+// their per-turn calls) carry behavioral weight. Which rows are paired was
+// decided upstream over the FULL serve set (timestamp-adjacency matching in
+// parseProviderSources' reconciliation sweep) and arrives as a key set, so a
+// date-range slice that separates a row from its per-turn call cannot
+// double-count the request across adjacent day queries.
+// A turn made only of supplementary calls folds into the nearest behavioral
+// turn — but only within a 30-minute window (deliberately WIDER than the
+// 2-minute pairing window: folding only moves turn structure, and same-half-
+// hour cost stays on its own day), so a rollup stamped days after the last
+// activity keeps its own (weightless) turn and its cost stays on its own
+// day. A session with no behavioral turn at all keeps its supplementary
+// turns as-is — separate weightless containers, each on its own day.
+const FOLD_WINDOW_MS = 30 * 60 * 1000
+// Local calendar day of an epoch ms value, matching day-aggregator's local
+// bucketing (not UTC): the fold must not move a turn across the boundary the
+// daily rollup buckets on.
+function localDayKey(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+}
+function foldCopilotSupplementaryTurns(
+  sessionId: string,
+  turns: ClassifiedTurn[],
+  supplementaryStoreKeys: ReadonlySet<string> | undefined,
+): ClassifiedTurn[] {
+  const shutdownPrefix = `copilot:${sessionId}:shutdown`
+  let hasSupplementary = false
+  for (const t of turns) {
+    for (const c of t.assistantCalls) {
+      if (
+        c.deduplicationKey.startsWith(shutdownPrefix) ||
+        (c.deduplicationKey.startsWith('copilot-store:') && supplementaryStoreKeys?.has(c.deduplicationKey))
+      ) {
+        c.supplementaryAccounting = true
+        hasSupplementary = true
+      }
+    }
+  }
+  if (!hasSupplementary) return turns
+  const anchored: ClassifiedTurn[] = []
+  const floating: ClassifiedTurn[] = []
+  for (const t of turns) {
+    ;(t.assistantCalls.some(c => !c.supplementaryAccounting) ? anchored : floating).push(t)
+  }
+  if (floating.length === 0) return turns
+  if (anchored.length === 0) {
+    // No behavioral turn to fold into (a rollup-only session, or a range
+    // slice that excluded every behavioral turn). The supplementary turns
+    // stay SEPARATE: merging them into one container would re-anchor later
+    // legs' turn-level cost onto the first leg's day. They carry zero
+    // turn/call weight either way.
+    return turns
+  }
+  // Nearest anchored turn by timestamp via one sorted pass + binary search —
+  // a long session can hold thousands of turns and this runs on every serve.
+  const anchorTs = anchored
+    .map(a => ({ ts: new Date(a.timestamp).getTime(), turn: a }))
+    .filter(a => !Number.isNaN(a.ts))
+    .sort((a, b) => a.ts - b.ts)
+  const kept: ClassifiedTurn[] = [...anchored]
+  for (const t of floating) {
+    const ts = new Date(t.timestamp).getTime()
+    let best: ClassifiedTurn | null = null
+    let bestDist = Infinity
+    let bestAnchorTs = NaN
+    if (anchorTs.length > 0 && !Number.isNaN(ts)) {
+      let lo = 0
+      let hi = anchorTs.length - 1
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1
+        if (anchorTs[mid]!.ts < ts) lo = mid + 1
+        else hi = mid
+      }
+      for (const idx of [lo - 1, lo]) {
+        const a = anchorTs[idx]
+        if (!a) continue
+        const d = Math.abs(a.ts - ts)
+        if (d < bestDist) {
+          bestDist = d
+          best = a.turn
+          bestAnchorTs = a.ts
+        }
+      }
+    }
+    // Never fold across a local-day boundary: turn-level judgments (category
+    // cost, edit/one-shot counts) are anchored to the TURN's day while
+    // call-level totals bucket per call, so folding a 00:05 rollup into a
+    // 23:55 turn would seal its cost under the earlier day's categories while
+    // the headline counted it on its own — the two would stop reconciling.
+    const sameDay = best !== null && localDayKey(bestAnchorTs) === localDayKey(ts)
+    if (best && bestDist <= FOLD_WINDOW_MS && sameDay) {
+      best.assistantCalls = [...best.assistantCalls, ...t.assistantCalls]
+    } else {
+      kept.push(t)
+    }
+  }
+  return kept
 }
 
 // ── Cache-Aware Parsing Helpers ────────────────────────────────────────
@@ -2891,7 +3016,30 @@ async function parseProviderSources(
     }
 
     const fp = await fingerprintFile(source.path)
-    if (!fp) continue
+    if (!fp) {
+      // A source that was discovered but cannot be fingerprinted is skipped —
+      // but skipping is only safe when the file is genuinely GONE (discovery
+      // raced a deletion; nothing to hydrate). An unreadable-but-present file
+      // (EACCES/EIO) may hold changes no parser ever got to defer on, so the
+      // pass must not report full hydration (round-6 finding: an unreadable
+      // store fingerprint silently bypassed the deferral fence). Network
+      // sources have no file to be unreadable — their synthetic paths always
+      // stat ENOENT — and never defer here. Virtual-suffix paths (cursor
+      // `#…`, opencode `:…`) must be classified against the same underlying
+      // paths the fingerprint read: the compound path itself always ENOENTs.
+      if (provider.network) continue
+      for (const candidate of sourcePathStatCandidates(source.path)) {
+        const code = await stat(candidate).then(
+          () => null,
+          (e: unknown) => (e as NodeJS.ErrnoException).code ?? 'UNKNOWN'
+        )
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+          deferredRetryableSource = true
+          break
+        }
+      }
+      continue
+    }
 
     const cached = section.files[source.path]
     const action = reconcileFile(fp, cached)
@@ -2968,7 +3116,11 @@ async function parseProviderSources(
         // Store/merge parsed turns into the cache.
         // Durable providers use a union-by-deduplicationKey merge: existing turns
         // are NEVER deleted (preserves data for spans pruned from the DB), and
-        // only turns whose dedup keys are not already cached are appended.
+        // only turns whose dedup keys are not already cached are appended. A
+        // deliberate consequence: capture-only metadata on an already-cached key
+        // (copilot nanoAiu/requestMultiplier) is not backfilled by a re-parse.
+        // Safe because the parse version that admits store rows is the same one
+        // that captures the metadata, and the CLI never rewrites old rows.
         // Non-durable providers keep the original overwrite-or-append behaviour.
         if (provider.durableSources) {
           const existingEntry = section.files[source.path]
@@ -3000,6 +3152,12 @@ async function parseProviderSources(
         ;(diskCache as { _dirty?: boolean })._dirty = true
       } catch (err) {
         if (isSqliteBusyError(err)) {
+          // Deferred, not failed: the cache keeps serving this source's
+          // previous rows and the next refresh retries. But the data this
+          // read would have added is MISSING from this parse, so the run is a
+          // partial hydration — the daily backfill must not finalize history
+          // built on it (the same fence a stale read-only serve raises).
+          deferredRetryableSource = true
           warnProviderReadFailureOnce(providerName, err)
           continue
         }
@@ -3040,10 +3198,17 @@ async function parseProviderSources(
   }
 
   // 90-day age-out for durable providers: remove entries whose newest call is
-  // older than 90 days so the cache doesn't grow unboundedly over time.
+  // older than 90 days so the cache doesn't grow unboundedly. One scoped
+  // exemption: a source that declared retainWhilePresent and is still
+  // discovered IS the durable record itself (copilot's session-store.db) —
+  // pruning it would drop crash-only rows the file still holds and force a
+  // full re-read on the next refresh. Everything else — orphans, and ordinary
+  // still-present journal files — ages out on the pre-existing schedule.
   if (!readOnly && provider.durableSources) {
+    const retainPaths = new Set(sources.filter(s => s.retainWhilePresent).map(s => s.path))
     const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
+      if (retainPaths.has(cachedPath)) continue
       const newestTs = cachedFile.turns
         .flatMap(t => t.calls)
         .map(c => new Date(c.timestamp).getTime())
@@ -3056,6 +3221,224 @@ async function parseProviderSources(
     }
   }
 
+  // Copilot rollup-vs-store reconciliation, enforced at SERVE time — the sole
+  // precedence mechanism. Parsers cache both representations of a session
+  // unconditionally (per-request store rows and the shutdown rollup); the
+  // serve set is the one coherent snapshot, so deciding here cannot be raced
+  // by writers between a probe and a parse, and heals any path into the cache.
+  // Per (session, model): when store rows exist, the rollup calls are dropped
+  // and replaced by the rows PLUS per-leg residual calls for any usage a
+  // rollup leg carried beyond the rows in ITS OWN interval — rows commit
+  // strictly before their leg's shutdown line, so a leg at time T covers
+  // exactly the rows in (previous leg's T, T], and rows outside that interval
+  // (a crash tail after the last clean shutdown, a later DB reset) can never
+  // cancel a different leg's missing usage. A store missing requests a leg
+  // covered therefore still serves that tail exactly once, on the leg's own
+  // day; a complete store serves pure per-request granularity with every
+  // residual at zero. The decision reads only cached contents, never
+  // discovery: an absent or deleted store changes nothing at serve, so a
+  // finalized daily history can never flip when the store file comes and
+  // goes. Cached rows of a deleted store stop influencing results only when
+  // the 90-day age-out removes them.
+  //
+  // The same sweep resolves two identity questions from the full cached data
+  // so that answers are invariant across date ranges and file churn:
+  // - Row↔per-turn pairing (behavioral weight): a store row and the per-turn
+  //   call of the same request carry no shared id, so rows pair with same-
+  //   model per-turn calls by timestamp adjacency (monotone two-pointer
+  //   matching, 2-minute window — the two are written moments apart). The
+  //   paired rows' dedup keys become supplementary; unpaired rows are
+  //   store-only requests and keep behavioral weight. Computed over the FULL
+  //   serve set, never a range slice, so adjacent day queries agree with the
+  //   lifetime answer.
+  // - Project identity: every call of a session serves under the session's
+  //   session-state-derived label when the serve set knows it, else the store
+  //   rows' own label — so neither a store row cached before events.jsonl
+  //   existed nor an events.jsonl orphaned after a prune can split the
+  //   session across two grouping keys.
+  type CopilotStamped = { ts: number; input: number; cacheRead: number; cacheWrite: number; reasoning: number }
+  let copilotRecon: {
+    storeKeys: Set<string>
+    storeCalls: Map<string, CopilotStamped[]>
+    rollupLegs: Map<string, Array<CopilotStamped & { rawTs: string }>>
+    supplementaryStoreKeys: Set<string>
+    sessionProject: Map<string, string>
+    storeProject: Map<string, string>
+    nanRollupFallbackTs: Map<string, string>
+    sessionEarliestValidTs: Map<string, string>
+  } | null = null
+  if (providerName === 'copilot') {
+    const seenAggKeys = new Set<string>()
+    const storeKeys = new Set<string>()
+    const storeCalls = new Map<string, CopilotStamped[]>()
+    const rollupLegs = new Map<string, Array<CopilotStamped & { rawTs: string }>>()
+    const storeRowIds = new Map<string, Array<{ ts: number; dedupKey: string }>>()
+    const perTurnTs = new Map<string, number[]>()
+    const sessionProject = new Map<string, string>()
+    const storeProject = new Map<string, string>()
+    // Stable timestamp fallbacks for rollup calls whose own stamp cannot
+    // parse. Stability across serves is load-bearing: the daily union seals
+    // whatever day the call served under, so the fallback must never move as
+    // the session grows. The preceding valid timestamp in the SAME file is
+    // immutable (session files are append-only); the session's EARLIEST
+    // valid timestamp is the stable backstop (appends only add later ones).
+    // "Latest valid" would move on every resume and double the call across
+    // sealed days.
+    const nanRollupFallbackTs = new Map<string, string>()
+    const sessionEarliestValidTs = new Map<string, string>()
+    // Session-state per-turn calls carry no per-call project (the serve loop
+    // takes it from source.project), so resolve it the same way here — every
+    // call of the session must serve under the SAME label, whichever of the
+    // representations parsed first or survives on disk.
+    const sourceProjectByPath = new Map(sources.map(s => [s.path, s.project]))
+    for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
+      let lastValidTsInFile = ''
+      for (const turn of cachedFile.turns) {
+        const shutdownPrefix = `copilot:${turn.sessionId}:shutdown:`
+        for (const c of turn.calls) {
+          if (seenAggKeys.has(c.deduplicationKey)) continue
+          seenAggKeys.add(c.deduplicationKey)
+          const ts = new Date(c.timestamp).getTime()
+          const isStore = c.deduplicationKey.startsWith('copilot-store:')
+          const isRollup = c.deduplicationKey.startsWith(shutdownPrefix)
+          const aggKey = `${turn.sessionId}\n${c.model}`
+          if (!Number.isNaN(ts)) {
+            lastValidTsInFile = c.timestamp
+            const prev = sessionEarliestValidTs.get(turn.sessionId)
+            if (!prev || c.timestamp < prev) sessionEarliestValidTs.set(turn.sessionId, c.timestamp)
+          } else if (isRollup && lastValidTsInFile) {
+            nanRollupFallbackTs.set(c.deduplicationKey, lastValidTsInFile)
+          }
+          if (!isStore && !isRollup) {
+            const project = c.project ?? sourceProjectByPath.get(cachedPath)
+            if (project && !sessionProject.has(turn.sessionId)) sessionProject.set(turn.sessionId, project)
+            if (!Number.isNaN(ts)) {
+              const list = perTurnTs.get(aggKey) ?? []
+              list.push(ts)
+              perTurnTs.set(aggKey, list)
+            }
+            continue
+          }
+          if (Number.isNaN(ts)) continue
+          const stamped: CopilotStamped = {
+            ts,
+            input: c.usage.inputTokens,
+            cacheRead: c.usage.cacheReadInputTokens,
+            cacheWrite: c.usage.cacheCreationInputTokens,
+            reasoning: c.usage.reasoningTokens,
+          }
+          if (isStore) {
+            storeKeys.add(aggKey)
+            const list = storeCalls.get(aggKey) ?? []
+            list.push(stamped)
+            storeCalls.set(aggKey, list)
+            const ids = storeRowIds.get(aggKey) ?? []
+            ids.push({ ts, dedupKey: c.deduplicationKey })
+            storeRowIds.set(aggKey, ids)
+            if (c.project && !storeProject.has(turn.sessionId)) storeProject.set(turn.sessionId, c.project)
+          } else {
+            const legs = rollupLegs.get(aggKey) ?? []
+            legs.push({ ...stamped, rawTs: c.timestamp })
+            rollupLegs.set(aggKey, legs)
+          }
+        }
+      }
+    }
+    // Row↔per-turn pairing: monotone two-pointer matching over the sorted
+    // timestamp lists. Paired rows are the requests whose per-turn call is
+    // already served; the unpaired excess — the crash tail, or a whole
+    // store-only history — keeps its weight. The window is TIGHT (2 minutes):
+    // a request's row and its assistant.message are written at the same
+    // completion moment, seconds apart, while a crash-only row sits minutes
+    // to hours from any unrelated call — a wide window would let it pair
+    // against a neighbor whose own row is missing and hide the crash
+    // request's call weight. The residual ambiguity (a crash row landing
+    // within the window of an unrecorded-row request) is a double-failure
+    // conjunction and affects only call counts, never tokens.
+    const PAIR_WINDOW_MS = 2 * 60 * 1000
+    const supplementaryStoreKeys = new Set<string>()
+    for (const [aggKey, ids] of storeRowIds) {
+      const callTs = perTurnTs.get(aggKey)
+      if (!callTs?.length) continue
+      ids.sort((a, b) => a.ts - b.ts)
+      callTs.sort((a, b) => a - b)
+      let i = 0
+      let j = 0
+      while (i < ids.length && j < callTs.length) {
+        const d = ids[i]!.ts - callTs[j]!
+        if (Math.abs(d) <= PAIR_WINDOW_MS) {
+          supplementaryStoreKeys.add(ids[i]!.dedupKey)
+          i++
+          j++
+        } else if (d < 0) {
+          i++
+        } else {
+          j++
+        }
+      }
+    }
+    copilotRecon = { storeKeys, storeCalls, rollupLegs, supplementaryStoreKeys, sessionProject, storeProject, nanRollupFallbackTs, sessionEarliestValidTs }
+  }
+  const copilotServeProject = (sessionId: string): string | undefined =>
+    copilotRecon
+      ? copilotRecon.sessionProject.get(sessionId) ?? copilotRecon.storeProject.get(sessionId)
+      : undefined
+  const reconcileCopilotCalls = (turn: CachedTurn): CachedTurn | null => {
+    if (!copilotRecon) return turn
+    const shutdownPrefix = `copilot:${turn.sessionId}:shutdown:`
+    let changed = false
+    const kept: CachedCall[] = []
+    for (const c of turn.calls) {
+      if (c.deduplicationKey.startsWith(shutdownPrefix)) {
+        const tsValid = !Number.isNaN(new Date(c.timestamp).getTime())
+        if (tsValid && copilotRecon.storeKeys.has(`${turn.sessionId}\n${c.model}`)) {
+          // Store rows exist for this (session, model): the rollup is
+          // replaced by the rows plus the per-leg residuals synthesized at
+          // session assembly.
+          changed = true
+          continue
+        }
+        if (!tsValid) {
+          // A rollup whose timestamp cannot parse never entered the residual
+          // sweep, so dropping it would silently lose its usage — it serves
+          // instead (weightless supplementary). But served with the broken
+          // stamp it is invisible to every date-range filter (and poisons
+          // day keys), so it adopts a STABLE valid timestamp: the one
+          // preceding it in its own append-only file, else the session's
+          // earliest. Stability matters — a moving fallback (e.g. "latest")
+          // would relocate the call after a resume, doubling it across an
+          // already-sealed day and its new one. Only a session with no valid
+          // timestamp anywhere keeps the raw value.
+          const fallbackTs =
+            copilotRecon.nanRollupFallbackTs.get(c.deduplicationKey) ??
+            copilotRecon.sessionEarliestValidTs.get(turn.sessionId)
+          if (fallbackTs) {
+            kept.push({ ...c, timestamp: fallbackTs })
+            changed = true
+            continue
+          }
+        }
+        kept.push(c)
+        continue
+      }
+      if (c.deduplicationKey.startsWith('copilot-store:')) {
+        const project = copilotRecon.sessionProject.get(turn.sessionId)
+        if (project && c.project !== project) {
+          kept.push({ ...c, project })
+          changed = true
+          continue
+        }
+      }
+      kept.push(c)
+    }
+    if (!changed) return turn
+    if (kept.length === 0) return null
+    // Re-anchor a turn whose own stamp cannot parse to its first surviving
+    // call, mirroring turnSlicedToRange — day bucketing reads the turn stamp.
+    const turnTsValid = !Number.isNaN(new Date(turn.timestamp).getTime())
+    return { ...turn, calls: kept, ...(turnTsValid ? {} : { timestamp: kept[0]!.timestamp }) }
+  }
+
   // Query-time: derive SessionSummary from all cached turns.
   // Uses seenKeys (shared across providers) for cross-provider dedup.
   const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string }>()
@@ -3064,7 +3447,9 @@ async function parseProviderSources(
     const cachedFile = section.files[source.path]
     if (!cachedFile) continue
 
-    for (const turn of cachedFile.turns) {
+    for (const rawTurn of cachedFile.turns) {
+      const turn = reconcileCopilotCalls(rawTurn)
+      if (!turn) continue
       const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
       if (hasDup) continue
 
@@ -3086,7 +3471,7 @@ async function parseProviderSources(
       const classified = dateRange
         ? (classifiedTurnSlicedToRange(classifiedFull, dateRange) ?? classifiedFull)
         : classifiedFull
-      const project = slicedTurn.calls[0]?.project ?? source.project
+      const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? source.project
       const key = `${providerName}:${turn.sessionId}:${project}`
 
       const existing = sessionMap.get(key)
@@ -3121,7 +3506,9 @@ async function parseProviderSources(
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
       if (allDiscoveredFiles.has(cachedPath)) continue  // already counted above
 
-      for (const turn of cachedFile.turns) {
+      for (const rawTurn of cachedFile.turns) {
+        const turn = reconcileCopilotCalls(rawTurn)
+        if (!turn) continue
         const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
         if (hasDup) continue
 
@@ -3141,7 +3528,10 @@ async function parseProviderSources(
         const classified = dateRange
           ? (classifiedTurnSlicedToRange(classifiedFull, dateRange) ?? classifiedFull)
           : classifiedFull
-        const project = slicedTurn.calls[0]?.project ?? providerName
+        // Orphaned files lose their source.project; for copilot the recon
+        // maps restore the session's label so an events.jsonl pruned while
+        // its store rows live on cannot split the session (round-6 finding).
+        const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? providerName
         const key = `${providerName}:${turn.sessionId}:${project}`
 
         const existingEntry = sessionMap.get(key)
@@ -3157,11 +3547,121 @@ async function parseProviderSources(
     }
   }
 
+  // Copilot residuals: for every (session, model) where BOTH representations
+  // exist, each rollup LEG subtracts only the store rows in its own interval
+  // (previous leg's timestamp, its own timestamp] — rows commit strictly
+  // before their leg's shutdown line, so rows outside the interval (a crash
+  // tail, a later same-path reset) can never cancel a different leg's
+  // missing usage — and any remainder serves once as a supplementary call
+  // anchored at that leg's own timestamp, keeping the tail on the day the
+  // leg actually recorded it. Subject to the same inclusive date-range rule
+  // as the rollup it stands in for. Derived purely from cached contents, so
+  // it is identical across refresh and read-only serves and each leg's
+  // residual shrinks monotonically as later parses append the rows it stood
+  // in for.
+  if (copilotRecon) {
+    const residualsBySession = new Map<string, ParsedApiCall[]>()
+    for (const [aggKey, legs] of copilotRecon.rollupLegs) {
+      const rows = copilotRecon.storeCalls.get(aggKey)
+      if (!rows?.length) continue
+      const nl = aggKey.indexOf('\n')
+      const sessionId = aggKey.slice(0, nl)
+      const model = aggKey.slice(nl + 1)
+      legs.sort((a, b) => a.ts - b.ts)
+      // Legs sharing one timestamp have no interval between them — the
+      // strict (prev, ts] rule would hand all their rows to the first and
+      // mint a full-delta residual for the second, double-counting. Coalesce
+      // them into one leg so the shared instant subtracts its rows once.
+      const coalesced: Array<CopilotStamped & { rawTs: string }> = []
+      for (const leg of legs) {
+        const last = coalesced[coalesced.length - 1]
+        if (last && last.ts === leg.ts) {
+          last.input += leg.input
+          last.cacheRead += leg.cacheRead
+          last.cacheWrite += leg.cacheWrite
+          last.reasoning += leg.reasoning
+        } else {
+          coalesced.push({ ...leg })
+        }
+      }
+      rows.sort((a, b) => a.ts - b.ts)
+      let rowIdx = 0
+      let prevLegTs = -Infinity
+      for (let legIdx = 0; legIdx < coalesced.length; legIdx++) {
+        const leg = coalesced[legIdx]!
+        const covered = { input: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
+        while (rowIdx < rows.length && rows[rowIdx]!.ts <= leg.ts) {
+          const row = rows[rowIdx]!
+          if (row.ts > prevLegTs) {
+            covered.input += row.input
+            covered.cacheRead += row.cacheRead
+            covered.cacheWrite += row.cacheWrite
+            covered.reasoning += row.reasoning
+          }
+          rowIdx++
+        }
+        prevLegTs = leg.ts
+        const input = Math.max(0, leg.input - covered.input)
+        const cacheRead = Math.max(0, leg.cacheRead - covered.cacheRead)
+        const cacheWrite = Math.max(0, leg.cacheWrite - covered.cacheWrite)
+        const reasoning = Math.max(0, leg.reasoning - covered.reasoning)
+        if (input === 0 && cacheRead === 0 && cacheWrite === 0 && reasoning === 0) continue
+        if (dateRange) {
+          const ts = new Date(leg.rawTs)
+          if (Number.isNaN(ts.getTime()) || ts < dateRange.start || ts > dateRange.end) continue
+        }
+        const calls = residualsBySession.get(sessionId) ?? []
+        calls.push({
+          provider: 'copilot',
+          model,
+          usage: { inputTokens: input, outputTokens: 0, cacheCreationInputTokens: cacheWrite, cacheReadInputTokens: cacheRead, cachedInputTokens: 0, reasoningTokens: reasoning, webSearchRequests: 0 },
+          costUSD: calculateCost(model, input, 0, cacheWrite, cacheRead, 0),
+          tools: [], mcpTools: [], skills: [], subagentTypes: [],
+          hasAgentSpawn: false, hasPlanMode: false,
+          speed: 'standard', timestamp: leg.rawTs, bashCommands: [],
+          deduplicationKey: `copilot:${sessionId}:shutdown-residual:${model}:${legIdx}`,
+          supplementaryAccounting: true,
+        })
+        residualsBySession.set(sessionId, calls)
+      }
+    }
+    for (const [sessionId, calls] of residualsBySession) {
+      const project = copilotServeProject(sessionId) ?? providerName
+      const mapKey = `${providerName}:${sessionId}:${project}`
+      // One turn PER LEG timestamp: a session's residuals can span days, and
+      // a single container turn anchored at the first leg would let the fold
+      // drag a later leg's category cost onto an earlier day's turn.
+      const byTs = new Map<string, ParsedApiCall[]>()
+      for (const call of calls) {
+        const list = byTs.get(call.timestamp) ?? []
+        list.push(call)
+        byTs.set(call.timestamp, list)
+      }
+      const existing = sessionMap.get(mapKey)
+      const target = existing ?? { project, turns: [] as ClassifiedTurn[] }
+      for (const [ts, tsCalls] of byTs) {
+        target.turns.push({
+          userMessage: '',
+          assistantCalls: tsCalls,
+          timestamp: ts,
+          sessionId,
+          category: 'general',
+          retries: 0,
+          hasEdits: false,
+        })
+      }
+      if (!existing) sessionMap.set(mapKey, target)
+    }
+  }
+
   const projectMap = new Map<string, { projectPath?: string; sessions: SessionSummary[] }>()
   for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
-    const session = buildSessionSummary(sessionId, project, turns)
-    const explicitLinks = new Set(turns.flatMap(turn => turn.prRefs ?? []))
+    const assembledTurns = providerName === 'copilot'
+      ? foldCopilotSupplementaryTurns(sessionId, turns, copilotRecon?.supplementaryStoreKeys)
+      : turns
+    const session = buildSessionSummary(sessionId, project, assembledTurns)
+    const explicitLinks = new Set(assembledTurns.flatMap(turn => turn.prRefs ?? []))
     for (const link of prLinks ?? []) explicitLinks.add(link)
     if (explicitLinks.size) {
       session.prLinks = [...explicitLinks].sort()
@@ -3169,7 +3669,9 @@ async function parseProviderSources(
     }
     if (workingDirectory) session.workingDirectory = workingDirectory
     if (title) session.title = title
-    if (session.apiCalls > 0) {
+    // Supplementary-only sessions (e.g. a rollup with no per-turn calls) have
+    // apiCalls 0 by design but their tokens/cost are real and must serve.
+    if (session.apiCalls > 0 || session.totalCostUSD > 0 || session.totalInputTokens + session.totalOutputTokens + session.totalCacheReadTokens + session.totalCacheWriteTokens + session.totalReasoningTokens > 0) {
       const existing = projectMap.get(project)
       if (existing) {
         existing.sessions.push(session)
@@ -3190,7 +3692,7 @@ async function parseProviderSources(
 
 const CACHE_TTL_MS = 180_000
 const MAX_CACHE_ENTRIES = 10
-const sessionCache = new Map<string, { data: ProjectSummary[]; ts: number; startMs?: number; endMs?: number; sig?: string }>()
+const sessionCache = new Map<string, { data: ProjectSummary[]; ts: number; startMs?: number; endMs?: number; sig?: string; hydrationComplete?: boolean }>()
 
 // Burst reuse for a resident process (codeburn serve). Every payload command
 // anchors its range end at its own `new Date()`, so two panel fetches issued
@@ -3232,6 +3734,7 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
     const validatedClean = parseReuseValidator !== null && age <= VALIDATED_REUSE_CAP_MS && parseReuseValidator(entry.ts)
     if (!insideBurst && !validatedClean) continue
     if (endMs < entry.endMs || endMs - entry.endMs > Math.max(windowMs, validatedClean ? VALIDATED_REUSE_CAP_MS : 0)) continue
+    if (entry.hydrationComplete !== undefined) sessionHydrationComplete = entry.hydrationComplete
     return filterProjectsByDateRange(entry.data, dateRange)
   }
   return null
@@ -3264,7 +3767,11 @@ function cachePut(key: string, data: ProjectSummary[]) {
     const oldest = [...sessionCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0]
     if (oldest) sessionCache.delete(oldest[0])
   }
-  sessionCache.set(key, { data, ts: now, ...(putMeta ?? {}) })
+  // The hydration verdict is a property OF this result: a memo/burst hit
+  // must restore the verdict its data was parsed under, or a stale partial
+  // parse could be served while a later, unrelated parse's `true` lets the
+  // daily backfill seal history around the gap (round-6 finding).
+  sessionCache.set(key, { data, ts: now, hydrationComplete: sessionHydrationComplete, ...(putMeta ?? {}) })
   putMeta = null
 }
 
@@ -3707,10 +4214,18 @@ export function isSessionHydrationComplete(): boolean {
 // chart (gapStart = lastComputedDate + 1 never looks back at them).
 let readOnlyServedStale = false
 
+// Set when a changed source's read was deferred on a retryable failure (e.g.
+// a SQLITE_BUSY store): the parse completed but did not hydrate that source's
+// new data, so the run must not report hydration complete even in write mode.
+let deferredRetryableSource = false
+
 export async function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
   const key = cacheKey(dateRange, providerFilter)
   const cached = sessionCache.get(key)
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    if (cached.hydrationComplete !== undefined) sessionHydrationComplete = cached.hydrationComplete
+    return cached.data
+  }
   // The signature is the key minus the range: what must match for a burst
   // reuse (provider, config env, proxy hash) regardless of the now-anchor.
   const burstSig = cacheKey(undefined, providerFilter)
@@ -3784,6 +4299,7 @@ async function runParse(
 ): Promise<ProjectSummary[]> {
   const { isCold = false, readOnly = false, refreshLock } = options
   readOnlyServedStale = false
+  deferredRetryableSource = false
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const allSources = await discoverAllSessions(providerFilter)
@@ -3900,9 +4416,10 @@ async function runParse(
     }
   }
   // Assigned, not forced true: a read-only run that had to skip or stale real
-  // files reached the end of the scan without hydrating everything, and the
-  // daily backfill must not finalize history off it.
-  sessionHydrationComplete = !readOnly || !readOnlyServedStale
+  // files, or a write run that deferred a changed source on a retryable
+  // failure, reached the end of the scan without hydrating everything, and
+  // the daily backfill must not finalize history off it.
+  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource
 
   // Merge across providers by normalised project path so the same repository
   // is not double-counted when it was worked on with more than one tool

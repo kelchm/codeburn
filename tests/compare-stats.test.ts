@@ -623,3 +623,61 @@ describe('findModelStat', () => {
     expect(findModelStat(stats, 'claude-opus-9-9')).toBeUndefined()
   })
 })
+
+// Copilot serve sets carry supplementary accounting calls (shutdown rollups,
+// residuals, store rows paired with an already-counted per-turn call). They hold
+// real tokens/cost but no behavioral evidence, so the compare report — which is
+// entirely per-call/per-turn ratios — must not weigh them.
+function supplement(turn: ClassifiedTurn, model: string, cost: number): ClassifiedTurn {
+  turn.assistantCalls.unshift({
+    ...turn.assistantCalls[0]!,
+    model,
+    costUSD: cost,
+    supplementaryAccounting: true,
+    deduplicationKey: `supp-${Math.random()}`,
+  })
+  return turn
+}
+
+describe('supplementary accounting weight', () => {
+  it('takes the primary model from the first behavioral call, not a leading supplementary one', () => {
+    const project = makeProject([
+      supplement(makeTurn('opus-4-6', 0.10, { hasEdits: true }), 'rollup-model', 0.01),
+    ])
+    const stats = aggregateModelStats([project])
+
+    expect(stats.find(s => s.model === 'opus-4-6')!.totalTurns).toBe(1)
+    expect(stats.find(s => s.model === 'rollup-model')?.totalTurns ?? 0).toBe(0)
+  })
+
+  it('keeps supplementary cost and tokens but does not count them as calls', () => {
+    const project = makeProject([
+      supplement(makeTurn('opus-4-6', 0.10), 'opus-4-6', 0.04),
+    ])
+    const m = aggregateModelStats([project]).find(s => s.model === 'opus-4-6')!
+
+    expect(m.calls).toBe(1)
+    expect(m.cost).toBeCloseTo(0.14)
+    expect(m.outputTokens).toBe(400)
+  })
+
+  it('excludes an accounting-only turn from every efficiency surface', () => {
+    const accountingOnly = makeTurn('opus-4-6', 0.09, { hasEdits: true, category: 'debugging', speed: 'fast', hasAgentSpawn: true })
+    accountingOnly.assistantCalls[0]!.supplementaryAccounting = true
+    const project = makeProject([
+      makeTurn('opus-4-6', 0.10, { hasEdits: true, category: 'coding' }),
+      accountingOnly,
+    ])
+
+    const m = aggregateModelStats([project]).find(s => s.model === 'opus-4-6')!
+    expect(m.totalTurns).toBe(1)
+    expect(m.editTurns).toBe(1)
+
+    const categories = computeCategoryComparison([project], 'opus-4-6', 'other-model')
+    expect(categories.map(c => c.category)).toEqual(['coding'])
+
+    const style = computeWorkingStyle([project], 'opus-4-6', 'other-model')
+    expect(style.find(r => r.label === 'Delegation rate')!.valueA).toBeCloseTo(0)
+    expect(style.find(r => r.label === 'Fast mode usage')!.valueA).toBeCloseTo(0)
+  })
+})

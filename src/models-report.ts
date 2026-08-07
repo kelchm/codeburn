@@ -1,6 +1,7 @@
 import chalk from 'chalk'
 import stripAnsi from 'strip-ansi'
 
+import { isBehavioralCall } from './behavioral-weight.js'
 import { codexCredits } from './codex-credits.js'
 import { formatCost, formatTokens } from './format.js'
 import { getProvider } from './providers/index.js'
@@ -119,7 +120,11 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
             buckets.set(key, bucket)
           }
           bucket.inputTokens += call.usage.inputTokens
-          bucket.outputTokens += call.usage.outputTokens + call.usage.reasoningTokens
+          // Copilot reasoning tokens are already INSIDE outputTokens (same rule as cachedCallToApiCall
+          // in parser.ts), so folding them in would display phantom output for its store rows/rollups.
+          bucket.outputTokens += provider === 'copilot'
+            ? call.usage.outputTokens
+            : call.usage.outputTokens + call.usage.reasoningTokens
           bucket.cacheWriteTokens += call.usage.cacheCreationInputTokens
           // cacheReadInputTokens (Anthropic vocab) and cachedInputTokens (OpenAI vocab)
           // are two names for the same thing. Providers populate one or set both to the
@@ -131,7 +136,9 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
           if (!bucket.savingsBaselineModel && call.savingsBaselineModel) {
             bucket.savingsBaselineModel = call.savingsBaselineModel
           }
-          bucket.calls += 1
+          // Supplementary accounting calls keep their tokens and cost above but are not
+          // distinct requests, so they add no call weight (see behavioral-weight.ts).
+          if (isBehavioralCall(call)) bucket.calls += 1
 
           const modelKey = `${provider} ${model}`
           let perCat = perModelCategoryCost.get(modelKey)

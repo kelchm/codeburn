@@ -5,11 +5,24 @@ import { tmpdir } from 'os'
 import { createRequire } from 'node:module'
 
 import { copilot, createCopilotProvider, getVSCodeGlobalStorageDirs, getVSCodeWorkspaceStorageDirs } from '../../src/providers/copilot.js'
-import { isSqliteAvailable } from '../../src/sqlite.js'
+import { isSqliteAvailable, isSqliteBusyError } from '../../src/sqlite.js'
 import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
+
+// The machine running this suite may itself have a real
+// ~/.copilot/session-store.db, which discoverSessions would pick up by
+// default and leak into every discovery test's source list. Pin the path to
+// a nonexistent file globally; tests that need a store pass an explicit
+// fixture path to createCopilotProvider (or re-stub the env themselves).
+beforeEach(() => {
+  vi.stubEnv('CODEBURN_COPILOT_SESSION_STORE_DB', '/nonexistent/session-store.db')
+})
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 
 async function createSessionDir(sessionId: string, lines: string[], cwd = '/home/user/myproject') {
   const sessionDir = join(tmpDir, sessionId)
@@ -1783,6 +1796,709 @@ describe('copilot provider - OTel cache token parsing', () => {
 // {"__first__":{"type":"Subgraph",…}} blobs; the model and projectName are
 // separate serialized fields. These helpers reproduce that on-disk shape so
 // tests exercise the real regex/scan extraction path.
+
+// ---------------------------------------------------------------------------
+// Session-store tests (~/.copilot/session-store.db)
+//
+// The Copilot CLI and the GitHub Copilot desktop app write per-request usage
+// rows into assistant_usage_events. These tests verify the row → call
+// contract (cache-inclusive input decomposed, output excluded), the
+// discovery-time shutdown-rollup suppression for covered sessions, and the
+// graceful-absence path for stores predating the table. Fixture DBs are
+// built programmatically — never committed binaries.
+// ---------------------------------------------------------------------------
+
+/** Creates a minimal session-store.db schema matching the Copilot CLI store. */
+function createSessionStoreDb(dbPath: string): void {
+  const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+  const db = new DatabaseSync(dbPath)
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      cwd TEXT,
+      repository TEXT,
+      branch TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE assistant_usage_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      model TEXT NOT NULL,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      cache_read_tokens INTEGER,
+      cache_write_tokens INTEGER,
+      reasoning_tokens INTEGER,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `)
+  db.close()
+}
+
+interface UsageRowDef {
+  sessionId: string
+  model: string
+  // Cache-INCLUSIVE, as the CLI writes it (input + cache_read + cache_write).
+  inputTokens: number
+  outputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
+  // Explicit null writes SQL NULL (exercises the timestamp fallback chain);
+  // undefined gets a fixed default so unrelated tests stay deterministic.
+  createdAt?: string | null
+  cwd?: string
+  repository?: string
+  sessionCreatedAt?: string | null
+}
+
+function insertUsageRow(dbPath: string, row: UsageRowDef): void {
+  const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+  const db = new DatabaseSync(dbPath)
+  db.prepare(`INSERT OR IGNORE INTO sessions (id, cwd, repository, created_at) VALUES (?, ?, ?, ?)`)
+    .run(row.sessionId, row.cwd ?? null, row.repository ?? null, row.sessionCreatedAt ?? null)
+  db.prepare(
+    `INSERT INTO assistant_usage_events
+       (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    row.sessionId,
+    row.model,
+    row.inputTokens,
+    row.outputTokens ?? 0,
+    row.cacheReadTokens ?? 0,
+    row.cacheWriteTokens ?? 0,
+    row.reasoningTokens ?? 0,
+    row.createdAt === undefined ? '2026-08-01T12:00:00.000Z' : row.createdAt,
+  )
+  db.close()
+}
+
+const storeSource = (path: string) =>
+  ({ path, project: 'copilot', provider: 'copilot', sourceType: 'session-store' })
+
+describe.skipIf(!isSqliteAvailable())('copilot provider - session-store parsing', () => {
+  let dbPath: string
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'copilot-store-test-'))
+    dbPath = join(tmpDir, 'session-store.db')
+  })
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true })
+    vi.unstubAllEnvs()
+  })
+
+  it('decomposes cache-inclusive input_tokens per request row, output excluded', async () => {
+    createSessionStoreDb(dbPath)
+    // First two requests of a real CLI session: input_tokens is
+    // cache-INCLUSIVE (24680 = 2 + 0 + 24678), confirmed by the rows' own
+    // token_details_json split (tokenType:"input" holds the uncached
+    // remainder). The rows carry output tokens which must NOT be emitted —
+    // per-turn output is owned by the events.jsonl assistant.message calls.
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-a', model: 'claude-sonnet-4-5',
+      inputTokens: 24680, outputTokens: 81, cacheReadTokens: 0, cacheWriteTokens: 24678,
+      createdAt: '2026-08-07T17:56:38.756Z', cwd: '/home/user/myproject',
+    })
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-a', model: 'claude-sonnet-4-5',
+      inputTokens: 24793, outputTokens: 19, cacheReadTokens: 24678, cacheWriteTokens: 113,
+      createdAt: '2026-08-07T17:56:40.414Z',
+    })
+
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(2)
+
+    const first = calls[0]!
+    // <sid>:<rowId> plus a content discriminator (created_at + token counts +
+    // model, hashed) so a same-path DB reset reusing AUTOINCREMENT ids can
+    // never alias a different request onto a cached key.
+    expect(first.deduplicationKey).toMatch(/^copilot-store:sess-a:1:[0-9a-z]+$/)
+    expect(first.model).toBe('claude-sonnet-4-5')
+    expect(first.inputTokens).toBe(2)               // 24680 - 0 - 24678
+    expect(first.cacheReadInputTokens).toBe(0)
+    expect(first.cacheCreationInputTokens).toBe(24678)
+    expect(first.outputTokens).toBe(0)
+    expect(first.costIsEstimated).toBe(false)        // measured, not estimated
+    expect(first.costUSD).toBeCloseTo(calculateCost('claude-sonnet-4-5', 2, 0, 24678, 0, 0), 12)
+    expect(first.costUSD).toBeGreaterThan(0)
+    expect(first.project).toBe('myproject')          // sessions.cwd basename
+    expect(first.sessionId).toBe('sess-a')
+    expect(first.timestamp).toBe('2026-08-07T17:56:38.756Z')
+
+    const second = calls[1]!
+    expect(second.deduplicationKey).toMatch(/^copilot-store:sess-a:2:[0-9a-z]+$/)
+    expect(second.inputTokens).toBe(2)               // 24793 - 24678 - 113
+    expect(second.cacheReadInputTokens).toBe(24678)
+    expect(second.cacheCreationInputTokens).toBe(113)
+  })
+
+  it('captures total_nano_aiu and request_multiplier when the schema has them', async () => {
+    // Billing-schema store (newer CLI): the optional columns ride the calls
+    // as capture-only metadata — no pricing or display consumes them (#890)
+    // — and stay OUT of the dedup-key content hash.
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+    const db = new DatabaseSync(dbPath)
+    db.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, repository TEXT, branch TEXT, created_at TEXT DEFAULT (datetime('now')));
+      CREATE TABLE assistant_usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        model TEXT NOT NULL,
+        input_tokens INTEGER, output_tokens INTEGER,
+        cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER,
+        total_nano_aiu INTEGER, request_multiplier REAL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+    `)
+    db.prepare(`INSERT INTO sessions (id, cwd) VALUES ('sess-aiu', '/home/user/proj')`).run()
+    db.prepare(
+      `INSERT INTO assistant_usage_events
+         (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_nano_aiu, request_multiplier, created_at)
+       VALUES ('sess-aiu', 'claude-sonnet-4-5', 1000, 20, 600, 300, 0, 24594000000, 15.0, '2026-08-07T18:00:00.000Z')`
+    ).run()
+    db.close()
+
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.nanoAiu).toBe(24594000000)
+    expect(calls[0]!.requestMultiplier).toBe(15)
+    expect(calls[0]!.inputTokens).toBe(100)          // 1000 - 600 - 300
+  })
+
+  it('parses identically when the billing columns are absent (older store schema)', async () => {
+    createSessionStoreDb(dbPath)  // schema predates total_nano_aiu / request_multiplier
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-old', model: 'claude-sonnet-4-5',
+      inputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0,
+      createdAt: '2026-08-07T18:00:00.000Z',
+    })
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(500)
+    expect(calls[0]!.nanoAiu).toBeUndefined()
+    expect(calls[0]!.requestMultiplier).toBeUndefined()
+  })
+
+  it('bills a multi-model (delegating) session per row model', async () => {
+    createSessionStoreDb(dbPath)
+    // A delegating CLI session: subagent requests land as their own rows with
+    // a distinct model, exactly as observed for haiku-backed subagents.
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-multi', model: 'claude-sonnet-4-5',
+      inputTokens: 10100, cacheReadTokens: 8000, cacheWriteTokens: 2000, reasoningTokens: 94,
+    })
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-multi', model: 'claude-haiku-4.5',
+      inputTokens: 5050, cacheReadTokens: 5000, cacheWriteTokens: 0,
+    })
+
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(2)
+
+    const sonnet = calls.find(c => c.model === 'claude-sonnet-4-5')!
+    expect(sonnet.inputTokens).toBe(100)
+    expect(sonnet.reasoningTokens).toBe(94)
+    // Reasoning is metadata, never a cost line: the CLI's own
+    // token_details_json prices only input/cache/output, and reasoning
+    // tokens are a subset of output_tokens — billed by the per-turn
+    // assistant.message call. A cost above input+cache pricing here means
+    // reasoning got billed twice.
+    expect(sonnet.costUSD).toBeCloseTo(calculateCost('claude-sonnet-4-5', 100, 0, 2000, 8000, 0), 12)
+    const haiku = calls.find(c => c.model === 'claude-haiku-4.5')!
+    expect(haiku.inputTokens).toBe(50)
+    expect(haiku.cacheReadInputTokens).toBe(5000)
+  })
+
+  it('skips all-zero rows and reads SQL-default timestamps as UTC', async () => {
+    createSessionStoreDb(dbPath)
+    // A row with no input/cache/reasoning adds nothing over the per-turn
+    // events (output is excluded by design) — no empty $0 call.
+    insertUsageRow(dbPath, { sessionId: 'sess-z', model: 'gpt-5', inputTokens: 0, outputTokens: 42 })
+    // created_at written by SQLite's datetime('now') default: UTC but
+    // timezone-less, with and without subseconds. Neither may be read as
+    // local time — that would land the request on the wrong day.
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-z', model: 'gpt-5',
+      inputTokens: 500, cacheReadTokens: 200, createdAt: '2026-08-07 17:56:38',
+    })
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-z', model: 'gpt-5',
+      inputTokens: 600, cacheReadTokens: 300, createdAt: '2026-08-07 23:59:59.756',
+    })
+
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.timestamp).toBe('2026-08-07T17:56:38.000Z')
+    expect(calls[1]!.timestamp).toBe('2026-08-07T23:59:59.756Z')
+  })
+
+  it('keeps dedup keys stable as the store grows', async () => {
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, { sessionId: 'sess-grow', model: 'gpt-5', inputTokens: 1000, cacheReadTokens: 400 })
+
+    const seen = new Set<string>()
+    const first = await collectCalls(storeSource(dbPath), seen)
+    expect(first.map(c => c.deduplicationKey)).toEqual([
+      expect.stringMatching(/^copilot-store:sess-grow:1:[0-9a-z]+$/),
+    ])
+
+    // Unchanged store re-parsed with the shared dedup set: nothing re-emits —
+    // the key (including its content discriminator) is stable across parses.
+    expect(await collectCalls(storeSource(dbPath), seen)).toHaveLength(0)
+
+    // New request row: only it is emitted, under the next AUTOINCREMENT id —
+    // the append-only shape the durable union-by-key cache merge requires.
+    insertUsageRow(dbPath, { sessionId: 'sess-grow', model: 'gpt-5', inputTokens: 2000, cacheReadTokens: 900 })
+    const grown = await collectCalls(storeSource(dbPath), seen)
+    expect(grown.map(c => c.deduplicationKey)).toEqual([
+      expect.stringMatching(/^copilot-store:sess-grow:2:[0-9a-z]+$/),
+    ])
+  })
+
+  it('gives a reused row id a NEW key when the DB was recreated with different content', async () => {
+    // Same path, same session, same AUTOINCREMENT id — but the store was
+    // deleted and recreated, so row id 1 now describes a DIFFERENT request.
+    // A bare <sid>:<rowId> key would make the durable union swallow the new
+    // row as already-cached, losing its usage; the content discriminator
+    // must split the two. A byte-identical re-insert (backup restore) must
+    // still collapse to the SAME key.
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-reset', model: 'gpt-5',
+      inputTokens: 100, cacheReadTokens: 0, createdAt: '2026-08-07T10:00:00.000Z',
+    })
+    const before = await collectCalls(storeSource(dbPath))
+    expect(before).toHaveLength(1)
+
+    await rm(dbPath, { force: true })
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-reset', model: 'gpt-5',
+      inputTokens: 200, cacheReadTokens: 0, createdAt: '2026-08-08T10:00:00.000Z',
+    })
+    const after = await collectCalls(storeSource(dbPath))
+    expect(after).toHaveLength(1)
+    expect(after[0]!.deduplicationKey).not.toBe(before[0]!.deduplicationKey)
+    expect(after[0]!.inputTokens).toBe(200)
+
+    // Identical content re-inserted under the same id: the key must NOT move.
+    await rm(dbPath, { force: true })
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-reset', model: 'gpt-5',
+      inputTokens: 200, cacheReadTokens: 0, createdAt: '2026-08-08T10:00:00.000Z',
+    })
+    const restored = await collectCalls(storeSource(dbPath))
+    expect(restored[0]!.deduplicationKey).toBe(after[0]!.deduplicationKey)
+  })
+
+  it('parses BOTH the store rows and the shutdown rollup for a covered session', async () => {
+    // Precedence is serve-time only: the parsers cache both representations
+    // unconditionally, and parseProviderSources drops the rollup calls of
+    // sessions whose store rows are being served (tests/parser.test.ts (i),
+    // (k), (m)). Suppressing here would re-open the probe-to-parse races the
+    // serve-time design closes, so this pins the parse-level contract: no
+    // parser-side suppression, ever.
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-covered', model: 'claude-sonnet-4-5',
+      inputTokens: 10100, cacheReadTokens: 8000, cacheWriteTokens: 2000,
+      cwd: '/home/user/myproject',
+    })
+    const eventsPath = await createSessionDir('sess-covered', [
+      modelChange('claude-sonnet-4-5'),
+      userMessage('do the thing'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 345 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 71282, outputTokens: 345, cacheReadTokens: 35495, cacheWriteTokens: 35783, reasoningTokens: 31 },
+        },
+      }),
+    ])
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')
+    expect(store).toBeDefined()
+    const jsonl = sources.find(s => s.path === eventsPath)
+    expect(jsonl).toBeDefined()
+
+    const seen = new Set<string>()
+    const collect = async (src: typeof sources[number]) => {
+      const out: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(src, seen).parse()) out.push(call)
+      return out
+    }
+    const storeCalls = await collect(store!)
+    const jsonlCalls = await collect(jsonl!)
+
+    expect(storeCalls.map(c => c.deduplicationKey)).toEqual([
+      expect.stringMatching(/^copilot-store:sess-covered:1:[0-9a-z]+$/),
+    ])
+    const rollup = jsonlCalls.find(c => c.deduplicationKey === 'copilot:sess-covered:shutdown:claude-sonnet-4-5:1')
+    expect(rollup).toBeDefined()
+    expect(rollup!.cacheReadInputTokens).toBe(35495)
+    expect(storeCalls[0]!.inputTokens).toBe(100)
+    expect(storeCalls[0]!.cacheReadInputTokens).toBe(8000)
+  })
+
+  it('keeps the shutdown rollup for sessions the store does not cover', async () => {
+    createSessionStoreDb(dbPath)
+    // The store knows about a DIFFERENT session (e.g. one run under a newer
+    // CLI); sess-uncovered predates the table's rows and must keep its
+    // rollup-derived input/cache.
+    insertUsageRow(dbPath, { sessionId: 'sess-other', model: 'gpt-5', inputTokens: 700, cacheReadTokens: 300 })
+    const eventsPath = await createSessionDir('sess-uncovered', [
+      modelChange('claude-sonnet-4-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 100 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 10100, outputTokens: 100, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+        },
+      }),
+    ])
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    const jsonl = sources.find(s => s.path === eventsPath)!
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(jsonl, new Set()).parse()) calls.push(call)
+
+    const rollup = calls.find(c => c.deduplicationKey === 'copilot:sess-uncovered:shutdown:claude-sonnet-4-5:1')
+    expect(rollup).toBeDefined()
+    expect(rollup!.inputTokens).toBe(100)
+    expect(rollup!.cacheReadInputTokens).toBe(8000)
+  })
+
+  it('a locked store still surfaces its source and never blocks session-state parsing', async () => {
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, { sessionId: 'sess-locked', model: 'gpt-5', inputTokens: 1000, cacheReadTokens: 400 })
+    const eventsPath = await createSessionDir('sess-locked', [
+      modelChange('claude-sonnet-4-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 100 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 10100, outputTokens: 100, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+        },
+      }),
+    ])
+
+    // Hold an exclusive write transaction across discovery AND both parses,
+    // the shape of a CLI mid-checkpoint. A lock proves nothing about
+    // absence, so the source must still surface — its path stays discovered
+    // and previously cached rows keep serving (and keep suppressing at
+    // serve time) — while its parse raises the busy shape
+    // parseProviderSources skips-and-retries. The session-state file no
+    // longer waits on the store for anything: its parse (rollup included)
+    // must succeed with the store locked the whole time.
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+    const locker = new DatabaseSync(dbPath)
+    locker.exec('BEGIN EXCLUSIVE')
+    try {
+      const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+      const sources = await provider.discoverSessions()
+      const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')
+      expect(store).toBeDefined()
+
+      const consumeStore = async () => {
+        for await (const _ of provider.createSessionParser(store!, new Set()).parse()) void _
+      }
+      await expect(consumeStore()).rejects.toSatisfy((err: unknown) => isSqliteBusyError(err))
+
+      const jsonl = sources.find(s => s.path === eventsPath)!
+      const calls: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(jsonl, new Set()).parse()) calls.push(call)
+      expect(calls.some(c => c.deduplicationKey === 'copilot:sess-locked:shutdown:claude-sonnet-4-5:1')).toBe(true)
+    } finally {
+      locker.exec('ROLLBACK')
+      locker.close()
+    }
+  })
+
+  it('surfaces the source when the store path cannot be stat-ed, and defers its parse', async () => {
+    // EACCES/EIO on stat must NOT read as absence: a store may exist that
+    // this run cannot see. The source stays discovered — so serve-time
+    // suppression keeps holding from previously cached rows — and its parse
+    // raises the busy shape parseProviderSources skips-and-retries. The
+    // session-state file parses normally either way.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return // root ignores modes
+    const deniedDir = join(tmpDir, 'denied')
+    await mkdir(deniedDir, { recursive: true })
+    const deniedDb = join(deniedDir, 'session-store.db')
+    createSessionStoreDb(deniedDb)
+    const eventsPath = await createSessionDir('sess-denied', [
+      modelChange('claude-sonnet-4-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 10 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 5100, outputTokens: 10, cacheReadTokens: 4000, cacheWriteTokens: 1000 },
+        },
+      }),
+    ])
+
+    const { chmod } = await import('fs/promises')
+    await chmod(deniedDir, 0o000)
+    try {
+      const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', deniedDb)
+      const sources = await provider.discoverSessions()
+      const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')
+      expect(store).toBeDefined()
+      const consumeStore = async () => {
+        for await (const _ of provider.createSessionParser(store!, new Set()).parse()) void _
+      }
+      await expect(consumeStore()).rejects.toSatisfy((err: unknown) => isSqliteBusyError(err))
+
+      const jsonl = sources.find(s => s.path === eventsPath)!
+      const calls: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(jsonl, new Set()).parse()) calls.push(call)
+      expect(calls.some(c => c.deduplicationKey === 'copilot:sess-denied:shutdown:claude-sonnet-4-5:1')).toBe(true)
+    } finally {
+      await chmod(deniedDir, 0o755)
+    }
+  })
+
+  it('defers the store source when the DB becomes unopenable after discovery', async () => {
+    // An EACCES/CANTOPEN race between discovery and parse must defer, not
+    // fall through to the generic parse-failure path — that would cache a
+    // failed marker at the current fingerprint and zero the covered
+    // sessions until the file next changes.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return // root ignores modes
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, { sessionId: 'sess-open', model: 'gpt-5', inputTokens: 1000, cacheReadTokens: 400 })
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')!
+
+    const { chmod } = await import('fs/promises')
+    await chmod(dbPath, 0o000)
+    try {
+      const consume = async () => {
+        for await (const _ of provider.createSessionParser(store, new Set()).parse()) void _
+      }
+      await expect(consume()).rejects.toSatisfy((err: unknown) => isSqliteBusyError(err))
+    } finally {
+      await chmod(dbPath, 0o644)
+    }
+  })
+
+  it('defers the store parse when the schema changes mid-run', async () => {
+    // Discovery prepare-validated the schema this run, so a query failure at
+    // parse time proves a mid-run migration. Falling through to the generic
+    // parse-failure path would cache an EMPTY success at the current
+    // fingerprint while cached rows keep suppressing rollups at serve time —
+    // a silent under-count until the file next changes. Defer instead.
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, { sessionId: 'sess-migrate', model: 'gpt-5', inputTokens: 1000, cacheReadTokens: 400 })
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')!
+
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+    const migrator = new DatabaseSync(dbPath)
+    migrator.exec('ALTER TABLE assistant_usage_events DROP COLUMN reasoning_tokens')
+    migrator.close()
+
+    const consume = async () => {
+      for await (const _ of provider.createSessionParser(store, new Set()).parse()) void _
+    }
+    await expect(consume()).rejects.toMatchObject({ code: 'SQLITE_BUSY' })
+  })
+
+  it('emits billable rows with an empty model as unknown instead of dropping them', async () => {
+    // TEXT NOT NULL admits '': a billable row must never be dropped for an
+    // unnameable model — serve-time precedence suppresses the session's
+    // rollup whenever its store rows serve, so a skipped row's tokens would
+    // simply vanish. Price as 'unknown' instead.
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-nomodel', model: '',
+      inputTokens: 10100, cacheReadTokens: 8000, cacheWriteTokens: 2000,
+    })
+
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('unknown')
+    expect(calls[0]!.inputTokens).toBe(100)
+    expect(calls[0]!.cacheReadInputTokens).toBe(8000)
+  })
+
+  it('surfaces the source when the store is corrupt, and defers its parse', async () => {
+    // Corruption-class failures (SQLITE_CORRUPT/NOTADB/CANTOPEN — measured as
+    // the store's realistic failure modes; WAL write locks don't even block
+    // readers) must NOT read as absence: the file may be mid atomic-replace
+    // and readable next run. The source stays discovered — cached rows keep
+    // serving and keep suppressing at serve time — while its parse defers
+    // with the busy shape. Session-state files parse normally throughout.
+    await writeFile(dbPath, 'not a sqlite database at all')
+    const eventsPath = await createSessionDir('sess-corrupt', [
+      modelChange('claude-sonnet-4-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 100 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 10100, outputTokens: 100, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+        },
+      }),
+    ])
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')
+    expect(store).toBeDefined()
+    const consumeStore = async () => {
+      for await (const _ of provider.createSessionParser(store!, new Set()).parse()) void _
+    }
+    await expect(consumeStore()).rejects.toMatchObject({ code: 'SQLITE_BUSY' })
+
+    const jsonl = sources.find(s => s.path === eventsPath)!
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(jsonl, new Set()).parse()) calls.push(call)
+    expect(calls.some(c => c.deduplicationKey === 'copilot:sess-corrupt:shutdown:claude-sonnet-4-5:1')).toBe(true)
+  })
+
+  it('treats a store whose schema the parser cannot read as absent', async () => {
+    // A schema mismatch ("no such column") is a permanent shape, not a
+    // transient failure: deferring would stall CLI parsing forever, and the
+    // rollups ARE the right source for a store the parser can't read. The
+    // probe runs the parser's exact query, so the mismatch is caught before
+    // any rollup is suppressed.
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+    const db = new DatabaseSync(dbPath)
+    db.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, repository TEXT);
+      CREATE TABLE assistant_usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER
+      );
+      INSERT INTO assistant_usage_events (session_id, model, input_tokens) VALUES ('sess-newschema', 'gpt-5', 900);
+    `)
+    db.close()
+
+    const eventsPath = await createSessionDir('sess-newschema', [
+      modelChange('claude-sonnet-4-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 50 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 5100, outputTokens: 50, cacheReadTokens: 4000, cacheWriteTokens: 1000 },
+        },
+      }),
+    ])
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    expect(sources.some(s => (s as { sourceType?: string }).sourceType === 'session-store')).toBe(false)
+
+    const jsonl = sources.find(s => s.path === eventsPath)!
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(jsonl, new Set()).parse()) calls.push(call)
+    expect(calls.some(c => c.deduplicationKey.includes(':shutdown:'))).toBe(true)
+  })
+
+  it('treats a store without assistant_usage_events as absent', async () => {
+    // Older CLI builds create session-store.db without the usage table. The
+    // source must not surface (and must not throw), and no session gets its
+    // shutdown rollup suppressed.
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+    const db = new DatabaseSync(dbPath)
+    db.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT)')
+    db.close()
+
+    const eventsPath = await createSessionDir('sess-old-cli', [
+      modelChange('claude-sonnet-4-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 50 }),
+      shutdownEvent({
+        modelMetrics: {
+          'claude-sonnet-4-5': { inputTokens: 5100, outputTokens: 50, cacheReadTokens: 4000, cacheWriteTokens: 1000 },
+        },
+      }),
+    ])
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    expect(sources.some(s => (s as { sourceType?: string }).sourceType === 'session-store')).toBe(false)
+
+    const jsonl = sources.find(s => s.path === eventsPath)!
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(jsonl, new Set()).parse()) calls.push(call)
+    expect(calls.some(c => c.deduplicationKey.includes(':shutdown:'))).toBe(true)
+  })
+
+  it('never emits an empty timestamp: falls back to the previous row, then sessions.created_at', async () => {
+    // A call with an empty timestamp is invisible to every date-range filter
+    // — the tokens would silently vanish from daily/monthly views while the
+    // session's rollup stays suppressed. Rows are id-ordered, so the nearest
+    // earlier row is the closest clock reading; a NULL on the very first row
+    // falls back to the session's own created_at.
+    createSessionStoreDb(dbPath)
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-nots', model: 'gpt-5',
+      inputTokens: 1000, cacheReadTokens: 400, createdAt: null,
+      sessionCreatedAt: '2026-08-05T09:00:00.000Z',
+    })
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-nots', model: 'gpt-5',
+      inputTokens: 2000, cacheReadTokens: 900, createdAt: '2026-08-05T09:05:00.000Z',
+    })
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-nots', model: 'gpt-5',
+      inputTokens: 3000, cacheReadTokens: 1400, createdAt: null,
+    })
+
+    const calls = await collectCalls(storeSource(dbPath))
+    expect(calls).toHaveLength(3)
+    expect(calls[0]!.timestamp).toBe('2026-08-05T09:00:00.000Z') // sessions.created_at
+    expect(calls[1]!.timestamp).toBe('2026-08-05T09:05:00.000Z') // its own created_at
+    expect(calls[2]!.timestamp).toBe('2026-08-05T09:05:00.000Z') // previous row's
+  })
+
+  it('attributes store rows to the jsonl-derived project, over sessions.cwd', async () => {
+    // The per-turn output calls carry the workspace.yaml-derived project,
+    // and the session grouping key includes project — so a store row landing
+    // under any OTHER label (the sessionId fallback for a NULL cwd, or a
+    // stale/differing sessions.cwd) splits one real session into two.
+    // Sessions with no session-state dir keep the cwd → repository →
+    // sessionId fallback chain.
+    createSessionStoreDb(dbPath)
+    // The review's verbatim shape: NULL cwd AND repository, jsonl present.
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-attr-null', model: 'gpt-5',
+      inputTokens: 1000, cacheReadTokens: 400,
+    })
+    // A present-but-differing sessions.cwd must also lose to the jsonl label.
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-attr-stale', model: 'gpt-5',
+      inputTokens: 1500, cacheReadTokens: 600, cwd: '/home/user/stale-db-cwd',
+    })
+    insertUsageRow(dbPath, {
+      sessionId: 'sess-nojsonl', model: 'gpt-5',
+      inputTokens: 2000, cacheReadTokens: 900, cwd: '/home/user/db-only-proj',
+    })
+    await createSessionDir('sess-attr-null', [
+      modelChange('gpt-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 10 }),
+    ], '/home/user/jsonl-proj')
+    await createSessionDir('sess-attr-stale', [
+      modelChange('gpt-5'),
+      assistantMessage({ messageId: 'msg-2', outputTokens: 10 }),
+    ], '/home/user/jsonl-proj')
+
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/ws', '/nonexistent/global', '/nonexistent/jb', dbPath)
+    const sources = await provider.discoverSessions()
+    const store = sources.find(s => (s as { sourceType?: string }).sourceType === 'session-store')!
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(store, new Set()).parse()) calls.push(call)
+    expect(calls.find(c => c.sessionId === 'sess-attr-null')!.project).toBe('jsonl-proj')
+    expect(calls.find(c => c.sessionId === 'sess-attr-stale')!.project).toBe('jsonl-proj')
+    expect(calls.find(c => c.sessionId === 'sess-nojsonl')!.project).toBe('db-only-proj')
+  })
+})
 
 describe('copilot provider - JetBrains parsing', () => {
   beforeEach(async () => {

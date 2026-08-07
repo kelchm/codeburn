@@ -1,10 +1,19 @@
 import { readdir, readFile } from 'fs/promises'
 import { join } from 'path'
 
-import type { ProjectSummary } from './types.js'
+import type { ClassifiedTurn, ProjectSummary } from './types.js'
+import { isBehavioralCall } from './behavioral-weight.js'
 import { getShortModelName } from './models.js'
 
 const PLANNING_TOOLS = new Set(['TaskCreate', 'TaskUpdate', 'TodoWrite', 'EnterPlanMode', 'ExitPlanMode'])
+
+/// The turn's primary model: the model of its FIRST BEHAVIORAL call. Undefined
+/// when the turn has none — accounting-only turns carry no behavioral evidence,
+/// so they are excluded from efficiency comparisons (their spend still appears
+/// in every spend report).
+function primaryTurnModel(turn: ClassifiedTurn): string | undefined {
+  return turn.assistantCalls.find(isBehavioralCall)?.model
+}
 
 export type ModelStats = {
   model: string
@@ -39,9 +48,8 @@ export function aggregateModelStats(projects: ProjectSummary[]): ModelStats[] {
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const turn of session.turns) {
-        if (turn.assistantCalls.length === 0) continue
-        const primaryModel = turn.assistantCalls[0]!.model
-        if (primaryModel === '<synthetic>') continue
+        const primaryModel = primaryTurnModel(turn)
+        if (primaryModel === undefined || primaryModel === '<synthetic>') continue
 
         const ms = ensure(primaryModel)
         ms.totalTurns++
@@ -57,7 +65,7 @@ export function aggregateModelStats(projects: ProjectSummary[]): ModelStats[] {
         for (const call of turn.assistantCalls) {
           if (call.model === '<synthetic>') continue
           const cs = call.model === primaryModel ? ms : ensure(call.model)
-          cs.calls++
+          if (isBehavioralCall(call)) cs.calls++
           cs.cost += call.costUSD
           cs.outputTokens += call.usage.outputTokens
           cs.inputTokens += call.usage.inputTokens
@@ -224,8 +232,7 @@ export function computeCategoryComparison(projects: ProjectSummary[], modelA: st
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const turn of session.turns) {
-        if (turn.assistantCalls.length === 0) continue
-        const primary = turn.assistantCalls[0]!.model
+        const primary = primaryTurnModel(turn)
         if (primary !== modelA && primary !== modelB) continue
 
         const acc = ensure(primary === modelA ? mapA : mapB, turn.category)
@@ -272,17 +279,17 @@ export function computeWorkingStyle(projects: ProjectSummary[], modelA: string, 
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const turn of session.turns) {
-        if (turn.assistantCalls.length === 0) continue
-        const primary = turn.assistantCalls[0]!.model
+        const primary = primaryTurnModel(turn)
         if (primary !== modelA && primary !== modelB) continue
 
         const s = primary === modelA ? sA : sB
         s.totalTurns++
-        const turnTools = turn.assistantCalls.flatMap(c => c.tools)
-        if (turnTools.some(t => PLANNING_TOOLS.has(t)) || turn.assistantCalls.some(c => c.hasPlanMode)) {
+        const behavioralCalls = turn.assistantCalls.filter(isBehavioralCall)
+        const turnTools = behavioralCalls.flatMap(c => c.tools)
+        if (turnTools.some(t => PLANNING_TOOLS.has(t)) || behavioralCalls.some(c => c.hasPlanMode)) {
           s.planModeUses++
         }
-        for (const call of turn.assistantCalls) {
+        for (const call of behavioralCalls) {
           s.totalToolCalls += call.tools.length
           if (call.hasAgentSpawn) s.agentSpawns++
           if (call.speed === 'fast') s.fastModeCalls++

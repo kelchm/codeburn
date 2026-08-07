@@ -85,6 +85,15 @@ const FILE_PROVIDERS: Record<string, string[]> = {
 // Copilot has since pruned from the DB that only the cache still holds.
 // Deferred until the durable carry-forward learns to merge instead of drop.
 const COPILOT_DEFERRED = 'deferred (Ruling 1): declaring it would force the durable re-parse that loses pruned OTel history'
+// The session-store override is allowlisted on its own reasoning, not merely
+// by inheriting the copilot deferral: repointing it cannot serve stale data,
+// because copilot's rollup-vs-store reconciliation reads only the cached
+// serve set (parseProviderSources), never a discovery-time snapshot. A new
+// path is a new source parsed on sight, and the old path's cached entries
+// persist as durable orphans that keep contributing what they always did —
+// there is no cross-file dependency for a fingerprint to catch, so declaring
+// it would buy nothing and cost the #927 durable-history loss.
+const COPILOT_STORE_DEFERRED = 'deferred (#927): repointing serves no stale data — serve-time reconciliation reads the cached serve set, so a new store path parses on sight and the old path stays a durable orphan'
 const ALLOWLIST: Record<string, string> = {
   'sqlite-session-parser.ts:CODEBURN_VERBOSE': 'sqlite-session-parser.ts:276 — logging verbosity only; changes no discovered path and no parsed value',
   'copilot.ts:CODEBURN_COPILOT_SESSION_STATE_DIR': COPILOT_DEFERRED,
@@ -93,6 +102,7 @@ const ALLOWLIST: Record<string, string> = {
   'copilot.ts:CODEBURN_COPILOT_WS_STORAGE_DIR': COPILOT_DEFERRED,
   'copilot.ts:CODEBURN_COPILOT_GLOBAL_STORAGE_DIR': COPILOT_DEFERRED,
   'copilot.ts:CODEBURN_COPILOT_DISABLE_OTEL': COPILOT_DEFERRED,
+  'copilot.ts:CODEBURN_COPILOT_SESSION_STORE_DB': COPILOT_STORE_DEFERRED,
   'copilot.ts:APPDATA': COPILOT_DEFERRED,
   'copilot.ts:XDG_CONFIG_HOME': COPILOT_DEFERRED,
   'copilot.ts:LOCALAPPDATA': COPILOT_DEFERRED,

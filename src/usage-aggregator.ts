@@ -1,5 +1,6 @@
 import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
+import { isBehavioralCall } from './behavioral-weight.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, buildMenubarPayload } from './menubar-json.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete } from './parser.js'
 import { findUnpricedModels, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
@@ -903,11 +904,16 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       for (const [m, d] of Object.entries(s.mcpBreakdown)) { mcpMap[m] = (mcpMap[m] ?? 0) + d.calls }
       for (const turn of s.turns) for (const call of turn.assistantCalls) {
         if (!call.savingsUSD || call.savingsUSD <= 0) continue
+        // Saved DOLLARS/tokens keep every call, but the `calls` figures are
+        // request counts: a supplementary accounting call (copilot rollup /
+        // paired store row) can carry configured model-savings too and must
+        // not count as a request.
+        const callWeight = isBehavioralCall(call) ? 1 : 0
         totalSavings += call.savingsUSD
-        totalSavingsCalls += 1
+        totalSavingsCalls += callWeight
         const modelKey = getShortModelName(call.model)
         const acc = savingsByModel.get(modelKey) ?? { calls: 0, actualUSD: 0, savingsUSD: 0, baselineModel: call.savingsBaselineModel ?? '', inputTokens: 0, outputTokens: 0 }
-        acc.calls += 1
+        acc.calls += callWeight
         acc.actualUSD += call.costUSD
         acc.savingsUSD += call.savingsUSD
         acc.baselineModel = acc.baselineModel || (call.savingsBaselineModel ?? '')
@@ -915,7 +921,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
         acc.outputTokens += call.usage.outputTokens
         savingsByModel.set(modelKey, acc)
         const provAcc = savingsByProvider.get(call.provider) ?? { calls: 0, savingsUSD: 0 }
-        provAcc.calls += 1
+        provAcc.calls += callWeight
         provAcc.savingsUSD += call.savingsUSD
         savingsByProvider.set(call.provider, provAcc)
       }

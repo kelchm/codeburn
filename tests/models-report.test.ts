@@ -32,6 +32,7 @@ function makeCall(opts: {
   costUSD: number
   input?: number
   output?: number
+  reasoning?: number
   cacheWrite?: number
   cacheRead?: number
 }): ParsedApiCall {
@@ -42,6 +43,7 @@ function makeCall(opts: {
       ...emptyTokens(),
       inputTokens: opts.input ?? 0,
       outputTokens: opts.output ?? 0,
+      reasoningTokens: opts.reasoning ?? 0,
       cacheCreationInputTokens: opts.cacheWrite ?? 0,
       cacheReadInputTokens: opts.cacheRead ?? 0,
     },
@@ -256,6 +258,25 @@ describe('aggregateModels', () => {
     ])
     const rows = await aggregateModels([project])
     expect(rows[0]!.outputTokens).toBe(250)
+  })
+
+  it('gives copilot supplementary accounting no call weight and no phantom reasoning output', async () => {
+    // One served request recorded twice: the per-turn call carries the full output, the
+    // paired store row carries that output's reasoning subset plus real input/cache tokens.
+    const perTurn = makeCall({ provider: 'copilot', model: 'claude-sonnet-4-5', input: 300, output: 500, cacheRead: 1000, costUSD: 1.0 })
+    const supplementary: ParsedApiCall = {
+      ...makeCall({ provider: 'copilot', model: 'claude-sonnet-4-5', input: 40, output: 0, reasoning: 800, cacheRead: 900, costUSD: 0.5 }),
+      supplementaryAccounting: true,
+    }
+    const rows = await aggregateModels([makeProject([makeTurn('feature', [perTurn, supplementary])])])
+    expect(rows).toHaveLength(1)
+    const row = rows[0]!
+    expect(row.calls).toBe(1)
+    expect(row.outputTokens).toBe(500)
+    // Tokens and cost keep every call, supplementary included.
+    expect(row.inputTokens).toBe(340)
+    expect(row.cacheReadTokens).toBe(1900)
+    expect(row.costUSD).toBeCloseTo(1.5, 6)
   })
 })
 

@@ -1,3 +1,4 @@
+import { behavioralCallCount, behavioralTurnCount } from './behavioral-weight.js'
 import { getShortModelName } from './models.js'
 import { CATEGORY_LABELS } from './types.js'
 import type { ProjectSummary, SessionSummary, TaskCategory } from './types.js'
@@ -52,7 +53,7 @@ export function aggregateSessions(projects: ProjectSummary[]): SessionRow[] {
     cost: session.totalCostUSD,
     savingsUSD: session.totalSavingsUSD,
     calls: session.apiCalls,
-    turns: session.turns.length,
+    turns: behavioralTurnCount(session.turns),
     inputTokens: session.totalInputTokens,
     outputTokens: session.totalOutputTokens,
     cacheReadTokens: session.totalCacheReadTokens,
@@ -286,7 +287,7 @@ export type SessionPrAttribution = {
 // Minimal structural shape a SessionSummary satisfies, so the state machine is
 // unit-testable without constructing a full session fixture.
 type AttributableSession = {
-  turns: Array<{ prRefs?: string[]; category?: string; assistantCalls: Array<{ costUSD: number; savingsUSD?: number; model?: string }> }>
+  turns: Array<{ prRefs?: string[]; category?: string; assistantCalls: Array<{ costUSD: number; savingsUSD?: number; model?: string; supplementaryAccounting?: boolean }> }>
   prLinks?: string[]
   totalCostUSD: number
   apiCalls: number
@@ -442,7 +443,7 @@ function sessionFingerprint(s: SessionSummary): string {
         ts: t.assistantCalls[0]?.timestamp ?? t.timestamp ?? '',
         prRefs: sortedCopy(t.prRefs),
         cost: t.assistantCalls.reduce((n, c) => n + c.costUSD, 0),
-        calls: t.assistantCalls.length,
+        calls: behavioralCallCount(t.assistantCalls),
         savings: t.assistantCalls.reduce((n, c) => n + (c.savingsUSD ?? 0), 0),
         models: modelCost,
       }
@@ -673,8 +674,10 @@ export function attributeSessionPrSpend(session: AttributableSession): SessionPr
   for (const turn of session.turns) {
     if (turn.prRefs?.length) current = turn.prRefs
     const cost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
-    const calls = turn.assistantCalls.length
+    const calls = behavioralCallCount(turn.assistantCalls)
     const savings = turn.assistantCalls.reduce((s, c) => s + (c.savingsUSD ?? 0), 0)
+    // Cost/savings keep every call, so a supplementary-only turn (calls === 0)
+    // still attributes its spend here — only a genuinely empty turn is skipped.
     if (cost === 0 && calls === 0 && savings === 0) continue
     if (current === null) {
       unattributed.cost += cost
@@ -895,11 +898,13 @@ export function aggregateByBranch(projects: ProjectSummary[]): BranchRow[] {
       let current: string | null = null
       for (const turn of session.turns) {
         if (turn.gitBranch) current = turn.gitBranch
+        // Raw gate: a supplementary-only turn still carries cost to attribute,
+        // even though it adds no behavioral calls.
         if (turn.assistantCalls.length === 0) continue
         const turnCost = turn.assistantCalls.reduce((sum, call) => sum + call.costUSD, 0)
         const row = byBranch.get(current) ?? { cost: 0, calls: 0, sessions: new Set<string>() }
         row.cost += turnCost
-        row.calls += turn.assistantCalls.length
+        row.calls += behavioralCallCount(turn.assistantCalls)
         row.sessions.add(session.sessionId)
         byBranch.set(current, row)
       }

@@ -559,3 +559,34 @@ describe('daily-cache ↔ report daily-bucket parity', () => {
     expect(historyByDate[dayB]).toBe(10)
   })
 })
+
+describe('supplementary accounting weight (copilot store/rollup calls)', () => {
+  it('adds cost and tokens but no call or turn weight, matching buildSessionSummary', () => {
+    // One real request served both ways: the per-turn call is behavioral, the
+    // paired store row is supplementary. Sealed daily history must agree with
+    // the live session summary (apiCalls 1), not double the call.
+    const behavioral = makeCall('2026-08-05T10:00:00Z', 1, 'claude-sonnet-4-5', 'copilot')
+    const supplementary = { ...makeCall('2026-08-05T10:00:05Z', 2, 'claude-sonnet-4-5', 'copilot'), supplementaryAccounting: true }
+    const day = aggregateProjectsIntoDays([makeSingleTurnProject([behavioral, supplementary])])[0]!
+    expect(day.calls).toBe(1)
+    expect(day.cost).toBeCloseTo(3, 12)
+    expect(day.inputTokens).toBe(200)
+    expect(day.models['claude-sonnet-4-5']!.calls).toBe(1)
+    expect(day.models['claude-sonnet-4-5']!.cost).toBeCloseTo(3, 12)
+    expect(day.providers['copilot']!.calls).toBe(1)
+    expect(day.categories['coding']!.turns).toBe(1)
+
+    // A turn made only of supplementary calls (a rollup-only session's
+    // accounting container): cost and tokens land, weight does not.
+    const aggOnly = aggregateProjectsIntoDays([makeSingleTurnProject([
+      { ...makeCall('2026-08-05T11:00:00Z', 2, 'claude-sonnet-4-5', 'copilot'), supplementaryAccounting: true },
+    ])])[0]!
+    expect(aggOnly.calls).toBe(0)
+    expect(aggOnly.cost).toBeCloseTo(2, 12)
+    expect(aggOnly.inputTokens).toBe(100)
+    expect(aggOnly.categories['coding']!.turns).toBe(0)
+    expect(aggOnly.editTurns).toBe(0)
+    expect(aggOnly.models['claude-sonnet-4-5']!.calls).toBe(0)
+    expect(aggOnly.providers['copilot']!.calls).toBe(0)
+  })
+})

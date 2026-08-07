@@ -1,3 +1,4 @@
+import { isBehavioralCall } from './behavioral-weight.js'
 import { getModelCosts, type ModelCosts } from './models.js'
 import { getProvider } from './providers/index.js'
 import { formatCost, formatTokens } from './format.js'
@@ -98,7 +99,9 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
           // cache-read vocabularies, so the audit's displayed total matches.
           bucket.cacheReadDisplayed += Math.max(u.cacheReadInputTokens, u.cachedInputTokens)
           bucket.attributedCostUSD += call.costUSD
-          bucket.calls += 1
+          // Supplementary accounting calls keep their tokens and cost above but are not
+          // distinct requests, so they add no call weight (see behavioral-weight.ts).
+          if (isBehavioralCall(call)) bucket.calls += 1
         }
       }
     }
@@ -120,9 +123,14 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
   const rows: AuditRow[] = []
   for (const bucket of buckets.values()) {
     const meta = await resolveProvider(bucket.provider)
+    // Buckets are keyed by (provider, model), so this provider test covers every call in one.
+    // Copilot reasoning tokens are already INSIDE outputTokens (same rule as cachedCallToApiCall
+    // in parser.ts), so folding them in would display phantom output for its store rows/rollups.
     const displayed = {
       inputTokens: bucket.raw.inputTokens,
-      outputTokens: bucket.raw.outputTokens + bucket.raw.reasoningTokens,
+      outputTokens: bucket.provider === 'copilot'
+        ? bucket.raw.outputTokens
+        : bucket.raw.outputTokens + bucket.raw.reasoningTokens,
       cacheWriteTokens: bucket.raw.cacheCreationInputTokens,
       cacheReadTokens: bucket.cacheReadDisplayed,
     }
@@ -207,7 +215,7 @@ export function renderAuditTable(rows: AuditRow[]): string {
   const legend = [
     '',
     'Columns are the raw token fields each provider records. codeburn then normalizes for pricing:',
-    '  - Reason folds into Output (priced output = output + reasoning)',
+    '  - Reason folds into Output (priced output = output + reasoning), except copilot, whose reasoning is already inside its output',
     '  - Cache rd = max(Anthropic cacheReadInput, OpenAI cached), since providers fill one or both',
     '  - Cache wr is priced at 1.25x the input rate, Cache rd at 0.1x, when a model omits explicit cache rates',
     'Use --format json for per-component cost, the rates applied, and both raw cache-read fields.',

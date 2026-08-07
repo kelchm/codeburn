@@ -220,6 +220,49 @@ describe('exportCsv', () => {
     expect(lines[1]).toContain("'+danger-model")
   })
 
+  it('keeps supplementary accounting rows in records.csv and marks them', async () => {
+    const project = makeProject('app')
+    const turn = project.sessions[0]!.turns[0]!
+    turn.assistantCalls.push({
+      ...turn.assistantCalls[0]!,
+      supplementaryAccounting: true,
+      costUSD: 0.5,
+      deduplicationKey: 'dedup-supp',
+    })
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
+
+    const folder = await exportCsv(periods, join(tmpDir, 'records.csv'))
+    const lines = (await readFile(join(folder, 'records.csv'), 'utf-8')).trimEnd().split('\n')
+
+    // The column exists on every row (undefined on normal ones), so rowsToCsv —
+    // which reads headers off the first row — always emits it.
+    expect(lines[0]!.endsWith(',supplementary')).toBe(true)
+    expect(lines[1]!.endsWith(',1.23,0,')).toBe(true)
+    expect(lines[2]!.endsWith(',0.5,0,true')).toBe(true)
+    expect(lines).toHaveLength(3)
+  })
+
+  it('counts only behavioral turns in the sessions.csv Turns column', async () => {
+    const project = makeProject('app')
+    const session = project.sessions[0]!
+    session.turns.push({
+      ...session.turns[0]!,
+      assistantCalls: [{
+        ...session.turns[0]!.assistantCalls[0]!,
+        supplementaryAccounting: true,
+        deduplicationKey: 'dedup-supp',
+      }],
+    })
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
+
+    const folder = await exportCsv(periods, join(tmpDir, 'sessions.csv'))
+    const [header, row] = (await readFile(join(folder, 'sessions.csv'), 'utf-8')).split('\n')
+    const turns = row!.split(',')[header!.split(',').indexOf('Turns')]
+
+    // Two raw turns, one of them accounting-only.
+    expect(turns).toBe('1')
+  })
+
   it('adds optional subagentType and unambiguous model fields to sessions.csv', async () => {
     const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app', 'planner')] }]
 
@@ -256,6 +299,49 @@ describe('exportJson', () => {
     expect(data.sessions[0]).toMatchObject({ subagentType: 'planner', model: '+danger-model' })
     expect(data.sessions[1]).toMatchObject({ model: '+danger-model' })
     expect(data.sessions[1]).not.toHaveProperty('subagentType')
+  })
+
+  it('keeps supplementary-accounting tokens/cost in daily rows without counting them as calls', async () => {
+    const project = makeProject('app')
+    const turn = project.sessions[0]!.turns[0]!
+    turn.assistantCalls.push({
+      ...turn.assistantCalls[0]!,
+      supplementaryAccounting: true,
+      usage: { ...turn.assistantCalls[0]!.usage, inputTokens: 40, outputTokens: 0, cacheReadInputTokens: 900 },
+      costUSD: 0.5,
+      deduplicationKey: 'dedup-supp',
+    })
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
+
+    const saved = await exportJson(periods, join(tmpDir, 'supp.json'))
+    const data = JSON.parse(await readFile(saved, 'utf-8'))
+
+    expect(data.periods[0].daily).toHaveLength(1)
+    expect(data.periods[0].daily[0]).toMatchObject({
+      'API Calls': 1,
+      'Input Tokens': 140,
+      'Cache Read Tokens': 900,
+      'Cost (USD)': 1.73,
+    })
+  })
+
+  it('marks supplementary records and omits the key on normal ones', async () => {
+    const project = makeProject('app')
+    const turn = project.sessions[0]!.turns[0]!
+    turn.assistantCalls.push({
+      ...turn.assistantCalls[0]!,
+      supplementaryAccounting: true,
+      costUSD: 0.5,
+      deduplicationKey: 'dedup-supp',
+    })
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
+
+    const saved = await exportJson(periods, join(tmpDir, 'supp-records.json'))
+    const data = JSON.parse(await readFile(saved, 'utf-8'))
+
+    expect(data.records).toHaveLength(2)
+    expect(data.records[0]).not.toHaveProperty('supplementary')
+    expect(data.records[1]).toMatchObject({ supplementary: true, cost: 0.5 })
   })
 
   it('includes an mcp section with per-server usage', async () => {

@@ -5,7 +5,24 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 17: copilot CLI sessions were misclassified as VS Code transcripts
+// Bumped to 19, deliberately skipping 18: an earlier head of this same change
+// (#946) was pushed publicly claiming v18 under DIFFERENT accounting — no
+// supplementary-call weighting, whole-session rollup suppression — and
+// adoptOlderDailyCaches/isMigratableCache would take those days forward as
+// finalized without re-deriving them. A distinct version is the only thing
+// that stops one version number meaning two accountings.
+//
+// v18 (never released): copilot input/cache tokens for sessions covered by the CLI's
+// session-store.db moved from one shutdown-rollup lump (stamped at session
+// end) to per-request DB rows with real timestamps, supplementary accounting
+// calls (rollups, covered rows) stopped counting as api/model calls, and
+// reasoning tokens left the copilot cost recompute (they are inside the
+// output the per-turn calls already bill). Per-day attribution, call counts
+// and costs all move, so days finalized at v17 would disagree with the live
+// parse. Re-derivation rides the v14 carry-forward semantics; sourceless
+// days carry forward as-is.
+//
+// v17: copilot CLI sessions were misclassified as VS Code transcripts
 // (#944), so days finalized at v16 or earlier carry output-only copilot costs —
 // the session.shutdown rollup's input/cache tokens were dropped. Raising
 // MIN_SUPPORTED_VERSION forces the one-time re-derivation under the
@@ -73,8 +90,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 17
-const MIN_SUPPORTED_VERSION = 17
+export const DAILY_CACHE_VERSION = 19
+const MIN_SUPPORTED_VERSION = 19
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

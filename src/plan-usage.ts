@@ -1,3 +1,4 @@
+import { behavioralCallCount } from './behavioral-weight.js'
 import { readPlans, type Plan, type PlanMap } from './config.js'
 import { parseAllSessions } from './parser.js'
 import { PLAN_PROVIDERS } from './plans.js'
@@ -129,7 +130,7 @@ export function getPlanUsageFromProjects(plan: Plan, projects: ProjectSummary[],
   }
 }
 
-function getPlanScopedProjects(plan: Plan, projects: ProjectSummary[], today: Date): ProjectSummary[] {
+export function getPlanScopedProjects(plan: Plan, projects: ProjectSummary[], today: Date): ProjectSummary[] {
   const { periodStart } = computePeriodFromResetDay(plan.resetDay, today)
   const provider = plan.provider
 
@@ -156,14 +157,17 @@ function getPlanScopedProjects(plan: Plan, projects: ProjectSummary[], today: Da
             (sum, turn) => sum + turn.assistantCalls.reduce((turnSum, call) => turnSum + call.costUSD, 0),
             0,
           )
-          const apiCalls = turns.reduce((sum, turn) => sum + turn.assistantCalls.length, 0)
-          return apiCalls > 0 ? { ...session, turns, totalCostUSD, apiCalls } : null
+          const apiCalls = turns.reduce((sum, turn) => sum + behavioralCallCount(turn.assistantCalls), 0)
+          // Keep on cost as well as calls: a copilot rollup-only session has
+          // zero behavioral calls but real spend, and dropping it would erase
+          // that spend from the plan window.
+          return apiCalls > 0 || totalCostUSD > 0 ? { ...session, turns, totalCostUSD, apiCalls } : null
         })
         .filter((session): session is NonNullable<typeof session> => session !== null)
 
       const totalCostUSD = sessions.reduce((sum, session) => sum + session.totalCostUSD, 0)
       const totalApiCalls = sessions.reduce((sum, session) => sum + session.apiCalls, 0)
-      return totalApiCalls > 0 ? { ...project, sessions, totalCostUSD, totalApiCalls } : null
+      return totalApiCalls > 0 || totalCostUSD > 0 ? { ...project, sessions, totalCostUSD, totalApiCalls } : null
     })
     .filter((project): project is NonNullable<typeof project> => project !== null)
 }

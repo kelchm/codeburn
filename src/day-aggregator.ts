@@ -1,6 +1,7 @@
 import type { DailyEntry, ProjectDayStats, ProviderDaySlice } from './daily-cache.js'
 import type { PeriodData } from './menubar-json.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
+import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
 
 function emptyEntry(date: string): DailyEntry {
   return {
@@ -114,8 +115,14 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
         const turnDate = dateKeyFn(turn.timestamp || turn.assistantCalls[0]!.timestamp)
         const turnDay = ensure(turnDate)
 
-        const editTurns = turn.hasEdits ? 1 : 0
-        const oneShotTurns = turn.hasEdits && turn.retries === 0 ? 1 : 0
+        // A turn whose calls are all supplementary accounting (copilot rollup
+        // / paired store rows) is not a behavioral exchange: its cost still
+        // lands in the category, but it must add no turn/edit weight here or
+        // sealed daily history diverges from the live session summaries
+        // (which apply the same rule in buildSessionSummary).
+        const behavioralTurn = isBehavioralTurn(turn)
+        const editTurns = behavioralTurn && turn.hasEdits ? 1 : 0
+        const oneShotTurns = behavioralTurn && turn.hasEdits && turn.retries === 0 ? 1 : 0
         const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
         const turnSavings = turn.assistantCalls.reduce((s, c) => s + (c.savingsUSD ?? 0), 0)
 
@@ -123,7 +130,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
         turnDay.oneShotTurns += oneShotTurns
 
         const cat = turnDay.categories[turn.category] ?? { turns: 0, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
-        cat.turns += 1
+        if (behavioralTurn) cat.turns += 1
         cat.cost += turnCost
         cat.savingsUSD += turnSavings
         cat.editTurns += editTurns
@@ -158,7 +165,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
           turnSlice.editTurns! += ownsTurn ? editTurns : 0
           turnSlice.oneShotTurns! += ownsTurn ? oneShotTurns : 0
           const sliceCat = turnSlice.categories![turn.category] ?? { turns: 0, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
-          sliceCat.turns += ownsTurn ? 1 : 0
+          sliceCat.turns += ownsTurn && behavioralTurn ? 1 : 0
           sliceCat.cost += totals.cost
           sliceCat.savingsUSD += totals.savingsUSD
           sliceCat.editTurns += ownsTurn ? editTurns : 0
@@ -168,6 +175,11 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
 
         for (const call of turn.assistantCalls) {
           const callSavings = call.savingsUSD ?? 0
+          // Same weight rule as buildSessionSummary: a supplementary
+          // accounting call contributes cost/tokens but is not a distinct
+          // request, so it must not increment any `calls` counter the daily
+          // cache seals (day, project, model, provider slice).
+          const callWeight = isBehavioralCall(call) ? 1 : 0
           // Call-derived values bucket under the call's OWN day (see the
           // two-rule comment above). An unparseable call timestamp falls back
           // to the turn's anchor day rather than producing a garbage date key.
@@ -176,7 +188,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
 
           callDay.cost += call.costUSD
           callDay.savingsUSD += callSavings
-          callDay.calls += 1
+          callDay.calls += callWeight
           callDay.inputTokens += call.usage.inputTokens
           callDay.outputTokens += call.usage.outputTokens
           callDay.cacheReadTokens += call.usage.cacheReadInputTokens
@@ -184,7 +196,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
 
           const dayProject = ensureProject(callDay, session.project, project.projectPath)
           dayProject.cost += call.costUSD
-          dayProject.calls += 1
+          dayProject.calls += callWeight
           dayProject.savingsUSD += callSavings
 
           const model = callDay.models[call.model] ?? {
@@ -192,7 +204,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
             inputTokens: 0, outputTokens: 0,
             cacheReadTokens: 0, cacheWriteTokens: 0,
           }
-          model.calls += 1
+          model.calls += callWeight
           model.cost += call.costUSD
           model.savingsUSD += callSavings
           model.inputTokens += call.usage.inputTokens
@@ -202,7 +214,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
           callDay.models[call.model] = model
 
           const slice = ensureSlice(callDay, call.provider)
-          slice.calls += 1
+          slice.calls += callWeight
           slice.cost += call.costUSD
           slice.savingsUSD += callSavings
           slice.inputTokens! += call.usage.inputTokens
@@ -212,7 +224,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
 
           const sliceProject = ensureProject(slice, session.project, project.projectPath)
           sliceProject.cost += call.costUSD
-          sliceProject.calls += 1
+          sliceProject.calls += callWeight
           sliceProject.savingsUSD += callSavings
 
           const sliceModel = slice.models![call.model] ?? {
@@ -220,7 +232,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
             inputTokens: 0, outputTokens: 0,
             cacheReadTokens: 0, cacheWriteTokens: 0,
           }
-          sliceModel.calls += 1
+          sliceModel.calls += callWeight
           sliceModel.cost += call.costUSD
           sliceModel.savingsUSD += callSavings
           sliceModel.inputTokens += call.usage.inputTokens

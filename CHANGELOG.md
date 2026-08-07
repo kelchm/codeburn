@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added (CLI)
+- **Copilot input/cache tokens are read per request from `~/.copilot/session-store.db`.** Previously, codeburn relied on `session.shutdown` rollups from the Copilot CLI and GitHub Copilot desktop app. Those rollups are written only after a clean shutdown, stamp all usage on the shutdown day, and reset their counters at in-session compaction — so a crash could lose an entire session's input/cache usage, and even cleanly-closed long sessions were silently truncated. On one machine with long history, reading the per-request rows recovered about 35% of actual Copilot spend. Covered sessions now use per-request tokens with their real timestamps, counted exactly once against existing rollups and never added as extra calls or turns. Pre-store CLI sessions continue using the unchanged rollup path, and a locked or unreadable store defers only its own re-read instead of prematurely sealing daily history. Copilot reasoning tokens are also no longer double-billed: they are a subset of output already priced through the per-turn calls. This triggers a one-time re-parse, with the daily cache bumped from v17 to v19 to re-derive finalized days. (#946)
+
 ## 0.9.20 - 2026-08-10
 
 ### Added

@@ -8,15 +8,17 @@ GitHub Copilot Chat (CLI, VS Code core chat sessions, VS Code extension transcri
 
 ## Where it reads from
 
-Three JSONL locations plus an optional OpenTelemetry SQLite source (see below). OTel is
-preferred when present; chatSessions are only discovered when no OTel source is found.
-Other discovered sources are walked on every run; results merge and dedupe.
+Three JSONL locations plus two optional SQLite sources (see the OTel and session-store
+sections). OTel is preferred when present; chatSessions are only discovered when no OTel
+source is found. Other discovered sources are walked on every run; results merge and
+dedupe.
 
 1. **Legacy CLI sessions:** `~/.copilot/session-state/`
 2. **VS Code core chat sessions:** `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/*.jsonl` plus `~/Library/Application Support/Code/User/globalStorage/emptyWindowChatSessions/*.jsonl` and equivalents on Windows / Linux
 3. **VS Code transcripts:** `~/Library/Application Support/Code/User/workspaceStorage/<hash>/GitHub.copilot-chat/transcripts/` and equivalents on Windows / Linux
 4. **OTel SQLite store:** VS Code Copilot Chat's `agent-traces.db` (see the OTel section). Preferred when present because it carries full input / output / cache token counts; legacy JSONL sources only record output tokens.
-5. **JetBrains IDE sessions:** `~/.config/github-copilot/<ide>/<kind>/<storeId>/copilot-*-nitrite.db` (see the JetBrains section). Covers IntelliJ IDEA, PyCharm, RubyMine, etc.
+5. **CLI session store:** `~/.copilot/session-store.db` (see the session-store section). One `assistant_usage_events` row per API request — the authoritative input/cache source for CLI and GitHub desktop-app sessions.
+6. **JetBrains IDE sessions:** `~/.config/github-copilot/<ide>/<kind>/<storeId>/copilot-*-nitrite.db` (see the JetBrains section). Covers IntelliJ IDEA, PyCharm, RubyMine, etc.
 
 ## Storage format
 
@@ -44,6 +46,52 @@ instead of trying to dedupe across stores.
   parse version, which discards the prior copilot cache. Spans already pruned from the DB
   before the upgrade cannot be recovered, so monotonicity starts from the upgrade point,
   not retroactively.
+
+## Session store (CLI / GitHub desktop app)
+
+The Copilot CLI and the GitHub Copilot desktop app both write
+`~/.copilot/session-store.db` (SQLite/WAL) unconditionally. Its
+`assistant_usage_events` table records one row per API request as it happens —
+where the `session.shutdown` rollup in `events.jsonl` is written only on clean
+shutdown (a crash loses the leg's input/cache accounting), lumps each leg into
+one per-model total, and resets its counters at in-session compaction. Rows are
+therefore authoritative for input / cache-read / cache-write / reasoning
+tokens, with real per-request timestamps; per-turn output stays owned by the
+`events.jsonl` `assistant.message` calls. `input_tokens` is cache-INCLUSIVE
+(input + cache_read + cache_write), the same convention as the rollups; the
+parser emits the uncached remainder. Override the path with
+`CODEBURN_COPILOT_SESSION_STORE_DB` (deliberately NOT in the env fingerprint —
+see the #927 ruling in `src/session-cache.ts`).
+
+- **Rollup reconciliation happens at serve time, per (session, model), in
+  `parseProviderSources`** — never in the parser. Both representations always
+  parse and cache; wherever store rows exist for a pair, the rollup calls are
+  dropped and each rollup leg's usage beyond the rows in its own interval
+  serves once as a synthesized residual call at that leg's timestamp. Sessions
+  with no rows (pre-store CLI builds) keep the rollup path unchanged.
+- **Behavioral weight.** Rollups and residuals are aggregate accounting: tokens
+  and cost count, but never api-call / model-call / turn weight. A store row
+  pairs with its per-turn call by timestamp adjacency (2-minute window,
+  computed over the full serve set); only unpaired rows — crash-recovered,
+  store-only requests — count as calls.
+- **Failure semantics.** True absence (ENOENT, no sqlite driver, `no such
+  table/column` from pre-store CLI builds) reads as absent — no source, rollups
+  rule. Every other failure (locked, EACCES, corrupt, mid-replace) emits the
+  source anyway: its parse defers on the busy shape, previously cached rows
+  keep serving, and the pass reports incomplete hydration so the daily
+  backfill holds its watermark.
+- **Durable cache.** Rides the same `durableSources` union as OTel, with one
+  scoped difference: the store declares `retainWhilePresent`, so its rows are
+  never evicted while the DB exists (crash-only rows have no rollup to fall
+  back to); every other copilot source keeps the standard durable schedule,
+  aging out at 90 days whether or not the file remains. A deleted store's rows
+  serve as orphans until the 90-day age-out. Reconciliation reads only cached
+  contents, so deleting or resetting the store never changes served totals.
+- **Billing metadata.** Each row's `total_nano_aiu` and `request_multiplier`
+  are captured onto the cached call when the store's schema has them (older
+  stores parse identically without). Nothing prices or displays them yet —
+  billing-grade cost is upstream #890.
+- **Requires Node 22+** (`node:sqlite`), same as the OTel source.
 
 ## JetBrains IDEs (IntelliJ, PyCharm, …)
 
@@ -160,11 +208,11 @@ surfaces, add a reader with a captured fixture.)
 
 ## Caching
 
-None for the JSONL sources. The OTel source uses a durable cache (see above).
+None for the JSONL sources. The OTel and session-store sources use the durable cache (see above).
 
 ## Deduplication
 
-Legacy JSONL and transcript sessions dedupe per `messageId`. Core chat sessions dedupe per `copilot-chatsession:<sessionId>:<requestId>`, and are not discovered when an OTel source is present. JetBrains `.db` turns dedupe per `copilot:jb:<conversationId>:<turnIndex>` (a per-conversation index, plus reply-content dedup within each conversation). These sources otherwise touch disjoint locations from the VS Code / CLI sources.
+Legacy JSONL and transcript sessions dedupe per `messageId`. Core chat sessions dedupe per `copilot-chatsession:<sessionId>:<requestId>`, and are not discovered when an OTel source is present. Session-store rows dedupe per `copilot-store:<sessionId>:<rowId>:<hash>` (the hash covers `created_at`, token counts, and model, so a same-path DB reset reusing AUTOINCREMENT ids cannot alias a different request onto a cached key); shutdown rollups per `copilot:<sessionId>:shutdown:<model>:<n>`, with serve-time residuals synthesized (never cached) under `copilot:<sessionId>:shutdown-residual:<model>:<leg>`. JetBrains `.db` turns dedupe per `copilot:jb:<conversationId>:<turnIndex>` (a per-conversation index, plus reply-content dedup within each conversation). These sources otherwise touch disjoint locations from the VS Code / CLI sources.
 
 If a workspace hash contains at least one `chatSessions/*.jsonl` file, the provider skips that hash's legacy `GitHub.copilot-chat/transcripts/` directory. The core chat session journal is the modern token-bearing source for the same conversations, so reading both would inflate call counts.
 

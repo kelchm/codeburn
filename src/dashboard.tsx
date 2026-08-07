@@ -14,6 +14,7 @@ import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
+import { behavioralCallCount } from './behavioral-weight.js'
 import { CompareView } from './compare.js'
 import { getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { planDisplayName } from './plans.js'
@@ -431,7 +432,7 @@ export function getDailyActivityRows(projects: ProjectSummary[]): DailyActivityR
         if (!turn.timestamp) continue
         const day = dateKey(turn.timestamp)
         dailyCosts[day] = (dailyCosts[day] ?? 0) + turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
-        dailyCalls[day] = (dailyCalls[day] ?? 0) + turn.assistantCalls.length
+        dailyCalls[day] = (dailyCalls[day] ?? 0) + behavioralCallCount(turn.assistantCalls)
       }
     }
   }

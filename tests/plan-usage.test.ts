@@ -4,8 +4,8 @@ import { join } from 'node:path'
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-import { savePlan } from '../src/config.js'
-import { activePlansFromMap, computePeriodFromResetDay, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
+import { savePlan, type Plan } from '../src/config.js'
+import { activePlansFromMap, computePeriodFromResetDay, getPlanScopedProjects, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
 import type { ProjectSummary } from '../src/types.js'
 
 const { parseAllSessionsMock } = vi.hoisted(() => ({
@@ -37,6 +37,75 @@ describe('computePeriodFromResetDay', () => {
   it('clamps reset day into 1..28', () => {
     const { periodStart } = computePeriodFromResetDay(99, new Date('2026-04-27T10:00:00.000Z'))
     expect(periodStart.getDate()).toBe(28)
+  })
+})
+
+describe('getPlanScopedProjects supplementary accounting', () => {
+  const plan: Plan = { id: 'custom', monthlyUsd: 100, provider: 'all', resetDay: 1, setAt: '2026-08-01T00:00:00.000Z' }
+  const today = new Date('2026-08-10T12:00:00.000Z')
+
+  function copilotCall(costUSD: number, timestamp: string, supplementaryAccounting: boolean) {
+    return {
+      provider: 'copilot',
+      model: 'claude-sonnet-4-5',
+      usage: {
+        inputTokens: supplementaryAccounting ? 40 : 0,
+        outputTokens: 0,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+        cachedInputTokens: 0,
+        reasoningTokens: 0,
+        webSearchRequests: 0,
+      },
+      costUSD,
+      tools: [],
+      mcpTools: [],
+      skills: [],
+      hasAgentSpawn: false,
+      hasPlanMode: false,
+      speed: 'standard',
+      timestamp,
+      bashCommands: [],
+      deduplicationKey: `copilot-${timestamp}`,
+      supplementaryAccounting,
+    }
+  }
+
+  it('weighs calls behaviorally and keeps a cost-bearing zero-call session', () => {
+    const scoped = getPlanScopedProjects(plan, [
+      {
+        project: 'codeburn',
+        projectPath: '/tmp/codeburn',
+        totalCostUSD: 1.75,
+        totalApiCalls: 2,
+        sessions: [
+          {
+            // One real request served alongside its paired store row.
+            turns: [{
+              timestamp: '2026-08-05T12:00:00.000Z',
+              assistantCalls: [
+                copilotCall(1.0, '2026-08-05T12:00:00.000Z', false),
+                copilotCall(0.5, '2026-08-05T12:00:05.000Z', true),
+              ],
+            }],
+          },
+          {
+            // Rollup-only session: real spend, zero behavioral requests.
+            turns: [{
+              timestamp: '2026-08-06T12:00:00.000Z',
+              assistantCalls: [copilotCall(0.25, '2026-08-06T12:00:00.000Z', true)],
+            }],
+          },
+        ],
+      },
+    ] as ProjectSummary[], today)
+
+    expect(scoped).toHaveLength(1)
+    expect(scoped[0]!.sessions.map(session => session.apiCalls)).toEqual([1, 0])
+    expect(scoped[0]!.sessions.map(session => session.totalCostUSD)).toEqual([1.5, 0.25])
+    expect(scoped[0]!.totalApiCalls).toBe(1)
+    expect(scoped[0]!.totalCostUSD).toBeCloseTo(1.75, 10)
+    expect(getPlanUsageFromProjects(plan, scoped, today).spentApiEquivalentUsd).toBeCloseTo(1.75, 10)
   })
 })
 

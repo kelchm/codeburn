@@ -89,6 +89,18 @@ function makeTurn(timestamp: string, costs: number[]): SessionSummary['turns'][n
   }
 }
 
+// Copilot serve sets pair a per-turn call with supplementary accounting rows
+// (shutdown rollups, residuals, store rows): real cost and tokens, zero
+// behavioral weight.
+function markSupplementary(turn: SessionSummary['turns'][number], indexes: number[]): SessionSummary['turns'][number] {
+  for (const index of indexes) {
+    const call = turn.assistantCalls[index]!
+    call.supplementaryAccounting = true
+    call.usage = { ...call.usage, inputTokens: 40 }
+  }
+  return turn
+}
+
 // Logic replicated from TopSessions component
 function getTopSessions(projects: ProjectSummary[], n = 5) {
   const all = projects.flatMap(p => p.sessions.map(s => ({ ...s, projectPath: p.projectPath })))
@@ -228,6 +240,20 @@ describe('Daily Activity history', () => {
     expect(getDailyActivityRows([makeProject('proj', [session])])).toEqual([
       { day: '2024-12-31', cost: 3, calls: 1 },
       { day: '2025-01-02', cost: 2, calls: 2 },
+    ])
+  })
+
+  it('spends supplementary accounting cost without counting it as a call', () => {
+    const session = makeSession('s1', 0)
+    session.turns = [
+      // One real request plus its paired store row.
+      markSupplementary(makeTurn('2026-08-05T12:00:00Z', [1.0, 0.5]), [1]),
+      // A rollup-only turn: cost with no behavioral request at all.
+      markSupplementary(makeTurn('2026-08-05T13:00:00Z', [0.25]), [0]),
+    ]
+
+    expect(getDailyActivityRows([makeProject('proj', [session])])).toEqual([
+      { day: '2026-08-05', cost: 1.75, calls: 1 },
     ])
   })
 

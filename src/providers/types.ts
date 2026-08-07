@@ -8,6 +8,14 @@ export type SessionSource = {
   sourceLabel?: string
   sourcePath?: string
   sourceKind?: 'claude-config' | 'claude-desktop'
+  // Durable providers only: while this exact path is still discovered, its
+  // cached entry is exempt from the 90-day age-out — the file IS the durable
+  // record (copilot's session-store.db), so pruning it would drop crash-only
+  // rows the source still holds and force a full re-read on the next refresh.
+  // Orphaned paths (no longer discovered) age out normally, and unflagged
+  // durable sources age out even while their file remains on disk (the cap
+  // bounds cache growth for provider-pruned journals).
+  retainWhilePresent?: boolean
 }
 
 export type SessionParser = {
@@ -44,6 +52,13 @@ export type ParsedProviderCall = {
   locAdded?: number
   locRemoved?: number
   editFailed?: number
+  // Copilot session-store billing metadata, captured only — no report consumes
+  // these yet (pricing/display design is upstream #890). total_nano_aiu is the
+  // request's charged AI-credit amount in nano-AIU (1e9 nano-AIU = 1 credit =
+  // $0.01); request_multiplier is the model's plan multiplier. Captured now so
+  // a future consumer needs no re-parse of rows the CLI may prune meanwhile.
+  nanoAiu?: number
+  requestMultiplier?: number
   turnId?: string
   toolSequence?: ToolCall[][]
   userMessage: string
@@ -74,9 +89,11 @@ export type Provider = {
   // fingerprinted or incrementally cached, so the parser re-fetches every run.
   network?: boolean
   // Source data is managed by an external process that may prune old records
-  // (e.g. VS Code's OTel agent-traces.db). Cached entries for discovered paths
-  // are never evicted, and orphaned entries (paths no longer discovered) are
-  // kept and included in query-time aggregation so the monthly total never drops.
+  // (e.g. VS Code's OTel agent-traces.db). Cached entries are never evicted on
+  // ordinary refreshes, and orphaned entries (paths no longer discovered) are
+  // kept and included in query-time aggregation so the monthly total never
+  // drops. All entries are subject to the 90-day age-out unless their source
+  // declares retainWhilePresent (see SessionSource).
   durableSources?: boolean
   modelDisplayName(model: string): string
   toolDisplayName(rawTool: string): string

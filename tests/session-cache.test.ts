@@ -22,6 +22,7 @@ import {
   reconcileFile,
   saveCache,
   sessionCachePath,
+  sourcePathStatCandidates,
 } from '../src/session-cache.js'
 
 // Version-suffixed filename (e.g. session-cache.v5.json) the cache now writes to.
@@ -907,5 +908,18 @@ describe('loadCache memo', () => {
     expect(third).toBe(external)
     expect(third).not.toBe(first)
     clearLoadCacheMemo()
+  })
+})
+
+describe('sourcePathStatCandidates', () => {
+  it('mirrors the fingerprint fallbacks: plain, #-suffixed, and :-suffixed paths', () => {
+    expect(sourcePathStatCandidates('/a/b/state.vscdb')).toEqual(['/a/b/state.vscdb'])
+    expect(sourcePathStatCandidates('/a/b/state.vscdb#cursor-ws=ws1'))
+      .toEqual(['/a/b/state.vscdb#cursor-ws=ws1', '/a/b/state.vscdb'])
+    expect(sourcePathStatCandidates('/a/b/db.sqlite:sess-1'))
+      .toEqual(['/a/b/db.sqlite:sess-1', '/a/b/db.sqlite'])
+    // A plain Windows path must NOT yield the bare drive letter — a stat
+    // error on a cwd-relative 'C' must never hold hydration.
+    expect(sourcePathStatCandidates('C:\\data\\gone.jsonl')).toEqual(['C:\\data\\gone.jsonl'])
   })
 })

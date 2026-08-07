@@ -10,6 +10,7 @@ import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
+import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
@@ -515,10 +516,16 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       if (!ts) { continue }
       const day = dateKey(ts)
       if (!dailyMap[day]) { dailyMap[day] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
-      dailyMap[day].turns += 1
-      if (turn.hasEdits) {
-        dailyMap[day].editTurns += 1
-        if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
+      // Turn weight follows day-aggregator.ts exactly: a turn whose calls are
+      // all supplementary accounting (copilot rollup / paired store rows) is
+      // not a behavioral exchange, so it adds cost below but no turn/edit
+      // weight here — otherwise this fallback disagrees with durable.days.
+      if (isBehavioralTurn(turn)) {
+        dailyMap[day].turns += 1
+        if (turn.hasEdits) {
+          dailyMap[day].editTurns += 1
+          if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
+        }
       }
       for (const call of turn.assistantCalls) {
         // Cost/savings/calls bucket under each call's OWN day — the same
@@ -531,7 +538,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
         if (!dailyMap[callDay]) { dailyMap[callDay] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
         dailyMap[callDay].cost += call.costUSD
         dailyMap[callDay].savings += call.savingsUSD ?? 0
-        dailyMap[callDay].calls += 1
+        dailyMap[callDay].calls += isBehavioralCall(call) ? 1 : 0
       }
     }
   }
@@ -1180,8 +1187,11 @@ program
         today: { cost: Math.round(todayData.cost * rate * 100) / 100, savings: Math.round(todayData.savingsUSD * rate * 100) / 100, calls: todayData.calls },
         month: { cost: Math.round(monthData.cost * rate * 100) / 100, savings: Math.round(monthData.savingsUSD * rate * 100) / 100, calls: monthData.calls },
       }
-      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? 1 : 0), 0), 0), 0), 0)
-      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? 1 : 0), 0), 0), 0), 0)
+      // Savings DOLLARS keep every call, but these are request COUNTS: a
+      // supplementary accounting call (copilot rollup / paired store row) can
+      // carry configured model-savings too and must not count as a request.
+      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
+      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
       if (todayData.savingsUSD > 0 || monthData.savingsUSD > 0) {
         payload.localModelSavings = {
           today: payload.today.savings,

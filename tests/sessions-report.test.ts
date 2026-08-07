@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { aggregateSessions, renderJson, renderTable } from '../src/sessions-report.js'
-import type { ClassifiedTurn, ProjectSummary, SessionSummary } from '../src/types.js'
+import { aggregateByBranch, aggregateSessions, attributeSessionPrSpend, renderJson, renderTable } from '../src/sessions-report.js'
+import type { ClassifiedTurn, ParsedApiCall, ProjectSummary, SessionSummary } from '../src/types.js'
 
 function makeProject(): ProjectSummary {
   const turn: ClassifiedTurn = {
@@ -141,5 +141,68 @@ describe('sessions JSON emitter', () => {
     expect(output.indexOf('Review the')).toBeLessThan(output.indexOf('Older task'))
     expect(output).not.toContain('Users-private')
     expect(Math.max(...lines.slice(0, -1).map(line => line.length))).toBeLessThanOrEqual(80)
+  })
+})
+
+// A copilot serve set pairs some calls with an already-counted per-turn call
+// (shutdown rollups, residuals, store rows). Their tokens and cost are real and
+// must survive into every spend surface, but they carry no behavioral weight, so
+// no user-visible calls/turns counter may count them.
+function copilotCall(overrides: Partial<ParsedApiCall> & { deduplicationKey: string }): ParsedApiCall {
+  return { ...makeProject().sessions[0]!.turns[0]!.assistantCalls[0]!, provider: 'copilot', ...overrides }
+}
+
+function makeSupplementaryProject(): ProjectSummary {
+  const project = makeProject()
+  const session = project.sessions[0]!
+  const mixed = session.turns[0]!
+  mixed.gitBranch = 'feat/copilot'
+  mixed.assistantCalls = [
+    copilotCall({ deduplicationKey: 'behavioral-1', costUSD: 0.10 }),
+    copilotCall({ deduplicationKey: 'supp-1', costUSD: 0.02, supplementaryAccounting: true }),
+  ]
+  session.turns.push({
+    ...mixed,
+    gitBranch: undefined,
+    timestamp: '2026-07-10T10:02:00.000Z',
+    assistantCalls: [copilotCall({ deduplicationKey: 'supp-2', costUSD: 0.05, supplementaryAccounting: true })],
+  })
+  session.apiCalls = 1
+  session.totalCostUSD = 0.17
+  return project
+}
+
+describe('supplementary accounting weight', () => {
+  it('counts only turns with a behavioral call in the session rows', () => {
+    const rows = aggregateSessions([makeSupplementaryProject()])
+    expect(rows[0]!.turns).toBe(1)
+    expect(rows[0]!.calls).toBe(1)
+    expect(rows[0]!.cost).toBeCloseTo(0.17)
+  })
+
+  it('attributes supplementary spend to a PR while counting only behavioral calls', () => {
+    const url = 'https://github.com/acme/app/pull/7'
+    const { perUrl } = attributeSessionPrSpend({
+      turns: [
+        { prRefs: [url], assistantCalls: [{ costUSD: 0.10 }, { costUSD: 0.02, supplementaryAccounting: true }] },
+        // Supplementary-only turn: no calls, but its cost still belongs to the PR.
+        { assistantCalls: [{ costUSD: 0.05, supplementaryAccounting: true }] },
+      ],
+      totalCostUSD: 0.17,
+      apiCalls: 1,
+      totalSavingsUSD: 0,
+    })
+
+    const pr = perUrl.get(url)!
+    expect(pr.calls).toBe(1)
+    expect(pr.cost).toBeCloseTo(0.17)
+  })
+
+  it('attributes supplementary spend to a branch while counting only behavioral calls', () => {
+    const rows = aggregateByBranch([makeSupplementaryProject()])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.branch).toBe('feat/copilot')
+    expect(rows[0]!.calls).toBe(1)
+    expect(rows[0]!.cost).toBeCloseTo(0.17)
   })
 })
